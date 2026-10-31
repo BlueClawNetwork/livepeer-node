@@ -144,7 +144,7 @@ finality, and nonces always read the chain directly.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `ChainRefreshInterval` / `--chain-refresh-interval` | `5s` | Time between refreshes. `0` disables the view; every request then reads the chain. |
-| `ChainMaxAge` / `--chain-max-age` | `30s` | Refuse payments when the view is older than this. It must exceed the interval. |
+| `ChainMaxAge` / `--chain-max-age` | `30s` | Refuse payments when the view is older than this. It must exceed the interval, and be at most `2m`. |
 
 Past the maximum age, or before the first refresh, payments fail as they do when
 a chain read fails and readiness fails with them. A failed refresh keeps the last
@@ -152,8 +152,10 @@ good view only until then.
 
 Requests may therefore act on chain state as old as the interval, or the maximum
 age while refreshes are failing, so a payer's new deposit can take a refresh to
-appear. Ticket parameters last 40 L1 blocks, about eight minutes; keep
-`ChainMaxAge` far below that. Lowering either setting raises idle RPC use: each
+appear. Ticket parameters last 40 L1 blocks, about eight minutes, so `ChainMaxAge`
+is capped far below that. A signer asks for fresh parameters earlier by the L1
+blocks its view can be behind, about one for every 12 seconds of `ChainMaxAge`, so
+it doesn't sign parameters the orchestrator has already seen expire. Lowering either setting raises idle RPC use: each
 refresh is two round trips of about seven calls, plus two per payer in use.
 
 A payer's first request reads its funds inline at the view's block, sharing the

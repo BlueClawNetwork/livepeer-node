@@ -114,6 +114,18 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	return v, nil
 }
 
+// MaxChainViewAge caps a view's maximum age. Ticket parameters last 40 L1 blocks,
+// about eight minutes, and what the view's age means for them depends on it staying
+// far below that.
+const MaxChainViewAge = 2 * time.Minute
+
+// ChainViewL1Blocks returns how many L1 blocks a view of this age can be behind,
+// rounded up, for someone comparing its clock with one that may be ahead of it.
+func ChainViewL1Blocks(age time.Duration) int64 {
+	const l1BlockTime = 12 * time.Second
+	return int64((age + l1BlockTime - 1) / l1BlockTime)
+}
+
 // errChainViewUnavailable fails a read as a failed chain read does. The view holds
 // no observation, or only one past the maximum age.
 var errChainViewUnavailable = errors.New("chain observation unavailable")

@@ -23,6 +23,7 @@ import (
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/j0sh/boa/pkg/boa"
+	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/test"
 	"github.com/livepeer/node/pm/wire"
 	"github.com/spf13/cobra"
@@ -79,6 +80,7 @@ func TestSignerConfigurationValidation(t *testing.T) {
 		{"invalid discovery grant", func(p *Params) { p.DiscoveryGrants = []string{"ftp://localhost"} }, "signer-discovery destination grant"},
 		{"negative chain refresh", func(p *Params) { p.ChainRefreshInterval = -time.Second }, "chain-refresh-interval"},
 		{"chain max age at the interval", func(p *Params) { p.ChainRefreshInterval, p.ChainMaxAge = time.Second, time.Second }, "chain-max-age"},
+		{"chain max age past the limit", func(p *Params) { p.ChainRefreshInterval, p.ChainMaxAge = time.Second, eth.MaxChainViewAge+time.Second }, "chain-max-age"},
 		{"chain max age below the interval", func(p *Params) { p.ChainRefreshInterval, p.ChainMaxAge = time.Minute, time.Second }, "chain-max-age"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

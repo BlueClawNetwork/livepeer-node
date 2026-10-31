@@ -93,6 +93,9 @@ func (p Params) Validate() error {
 	if err := validateDiscoveryPolling(p.DiscoveryRefreshInterval, p.DiscoveryMaxFailedRefreshes); err != nil {
 		return err
 	}
+	if p.ChainRefreshInterval > 0 && p.ChainMaxAge > eth.MaxChainViewAge {
+		return fmt.Errorf("--chain-max-age must be at most %s, far below the life of ticket parameters", eth.MaxChainViewAge)
+	}
 	if p.ChainRefreshInterval < 0 || (p.ChainRefreshInterval > 0 && p.ChainMaxAge <= p.ChainRefreshInterval) {
 		return errors.New("--chain-refresh-interval must be nonnegative and --chain-max-age must be greater than it; an interval of 0 reads the chain directly")
 	}

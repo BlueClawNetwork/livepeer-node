@@ -280,6 +280,7 @@ func TestChainViewSettings(t *testing.T) {
 		{"negative interval", -time.Second, time.Minute, "chain-refresh-interval"},
 		{"maximum age at the interval", time.Second, time.Second, "chain-max-age"},
 		{"maximum age below the interval", time.Minute, time.Second, "chain-max-age"},
+		{"maximum age past the limit", time.Second, eth.MaxChainViewAge + time.Second, "chain-max-age"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := valid
