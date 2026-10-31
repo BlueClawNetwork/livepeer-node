@@ -1,6 +1,7 @@
 package eth
 
 import (
+	"context"
 	"math/big"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/livepeer/node/internal/test"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -256,4 +258,74 @@ func TestChainViewDiscardsAnInlineReadThatOutlivesTheMaximumAge(t *testing.T) {
 	rpc.OnCall(func() { clock.Advance(31 * time.Second) })
 	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
 	require.ErrorIs(t, err, errChainViewUnavailable)
+}
+
+func TestChainViewConcurrentNewPayersShareOneRead(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.SetLatency(50 * time.Millisecond)
+	rpc.Reset()
+	var workers sync.WaitGroup
+	start := make(chan struct{})
+	for range 32 {
+		workers.Go(func() {
+			<-start
+			funds, err := view.PayerFunds(context.Background(), viewPayerAddress, viewRecipientAddress)
+			if assert.NoError(t, err) {
+				assert.Equal(t, big.NewInt(7), funds.Reserve)
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+	stats := rpc.Stats()
+	require.Equal(t, 1, stats.RoundTrips)
+	require.Equal(t, 1, stats.Calls["TicketBroker.getSenderInfo"])
+}
+
+func TestChainViewDoesNotCacheAFailedRead(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	other := ethcommon.HexToAddress("0x3001")
+	rpc.FailCalls(func(string, []byte) bool { return true })
+	_, err = view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.Error(t, err)
+	_, err = view.IsActiveAt(t.Context(), other, snapshot)
+	require.Error(t, err)
+	rpc.FailCalls(nil)
+	rpc.Reset()
+	funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(7), funds.Reserve)
+	active, err := view.IsActiveAt(t.Context(), other, snapshot)
+	require.NoError(t, err)
+	require.False(t, active)
+	require.Equal(t, 2, rpc.Stats().RoundTrips, "both reads went back to the RPC")
+}
+
+func TestChainViewCancelledCallerLeavesASharedReadRunning(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.SetLatency(100 * time.Millisecond)
+	first, cancel := context.WithCancel(t.Context())
+	failed := make(chan error, 1)
+	go func() {
+		_, err := view.PayerFunds(first, viewPayerAddress, viewRecipientAddress)
+		failed <- err
+	}()
+	require.Eventually(t, func() bool { return rpc.Stats().RoundTrips > 4 }, time.Second, time.Millisecond, "the first caller started the read")
+	second := make(chan error, 1)
+	go func() {
+		_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+		second <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-failed, context.Canceled)
+	require.NoError(t, <-second)
 }

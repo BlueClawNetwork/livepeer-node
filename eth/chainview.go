@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/livepeer/node/eth/contracts"
+	"golang.org/x/sync/singleflight"
 )
 
 // ChainView answers the payment path's chain reads from memory, so RPC load
@@ -27,6 +28,7 @@ type ChainView struct {
 	maxAge     time.Duration
 	now        func() time.Time
 	refreshing sync.Mutex // Observations run one at a time.
+	inline     singleflight.Group
 
 	mu         sync.Mutex
 	current    *chainObservation
@@ -52,6 +54,7 @@ type viewContracts struct{ rounds, bonding, broker ethcommon.Address }
 // only when pinned to that same block, so an observation never mixes blocks.
 type chainObservation struct {
 	at        time.Time // Taken before the block read, so age is never understated.
+	block     string
 	reference map[string]any
 	contracts viewContracts
 	snapshot  ChainSnapshot
@@ -135,22 +138,50 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 	if ok {
 		return active, nil
 	}
-	read := v.newRead(obs.reference)
-	active, err := activeTranscoder(ctx, read, obs.contracts.bonding, recipient)
-	if errors.Is(err, errViewCallPending) {
-		read.fetch(ctx)
-		active, err = activeTranscoder(ctx, read, obs.contracts.bonding, recipient)
-	}
+	value, err := v.readInline(ctx, obs, "active/"+recipient.Hex(), func(ctx context.Context, read *viewRead) (any, error) {
+		active, err := activeTranscoder(ctx, read, obs.contracts.bonding, recipient)
+		if errors.Is(err, errViewCallPending) {
+			read.fetch(ctx)
+			active, err = activeTranscoder(ctx, read, obs.contracts.bonding, recipient)
+		}
+		if err != nil {
+			return false, err
+		}
+		v.mu.Lock()
+		obs.active[recipient] = active
+		v.mu.Unlock()
+		return active, nil
+	})
 	if err != nil {
 		return false, err
 	}
-	if v.expired(obs) {
-		return false, errChainViewUnavailable
+	return value.(bool), nil
+}
+
+// viewInlineTimeout matches the RPC client's own request timeout.
+const viewInlineTimeout = 15 * time.Second
+
+// readInline runs one read pinned to an observation's block, shared by concurrent
+// callers. It outlives a caller that gives up, since others may be waiting. Errors
+// are returned to those sharing the read and then forgotten.
+func (v *ChainView) readInline(ctx context.Context, obs *chainObservation, key string, read func(context.Context, *viewRead) (any, error)) (any, error) {
+	result := v.inline.DoChan(obs.block+"/"+key, func() (any, error) {
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), viewInlineTimeout)
+		defer cancel()
+		return read(readCtx, v.newRead(obs.reference))
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case outcome := <-result:
+		if outcome.Err != nil {
+			return nil, outcome.Err
+		}
+		if v.expired(obs) {
+			return nil, errChainViewUnavailable
+		}
+		return outcome.Val, nil
 	}
-	v.mu.Lock()
-	obs.active[recipient] = active
-	v.mu.Unlock()
-	return active, nil
 }
 
 // PayerFunds returns a payer's funds from the current observation. An unseen payer
@@ -168,23 +199,25 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 	if ok {
 		return info.clone(), nil
 	}
-	read := v.newRead(obs.reference)
-	info, err = read.funds(ctx, obs.contracts.broker, key)
-	if errors.Is(err, errViewCallPending) {
-		read.fetch(ctx)
-		info, err = read.funds(ctx, obs.contracts.broker, key)
-	}
+	value, err := v.readInline(ctx, obs, "funds/"+payer.Hex()+"/"+recipient.Hex(), func(ctx context.Context, read *viewRead) (any, error) {
+		info, err := read.funds(ctx, obs.contracts.broker, key)
+		if errors.Is(err, errViewCallPending) {
+			read.fetch(ctx)
+			info, err = read.funds(ctx, obs.contracts.broker, key)
+		}
+		if err != nil {
+			return nil, err
+		}
+		info.Snapshot = obs.snapshot
+		v.mu.Lock()
+		obs.funds[key] = info
+		v.mu.Unlock()
+		return info, nil
+	})
 	if err != nil {
 		return SenderInfo{}, err
 	}
-	if v.expired(obs) {
-		return SenderInfo{}, errChainViewUnavailable
-	}
-	info.Snapshot = obs.snapshot
-	v.mu.Lock()
-	obs.funds[key] = info
-	v.mu.Unlock()
-	return info.clone(), nil
+	return value.(SenderInfo).clone(), nil
 }
 
 // Refresh reads one observation and publishes it. On failure the previous
@@ -212,7 +245,7 @@ func (v *ChainView) Refresh(ctx context.Context) error {
 		recipients = append(recipients, recipient)
 	}
 	v.mu.Unlock()
-	obs, err := v.newRead(reference).observe(ctx, at, block, prior, payers, recipients)
+	obs, err := v.newRead(reference).observe(ctx, at, header.Hash.Hex(), block, prior, payers, recipients)
 	if err != nil {
 		return err
 	}
@@ -361,7 +394,7 @@ const maxViewBatches = 3
 // observation fits one batch after the block read. Only results under the addresses
 // and round this block confirms are used; a wrong assumption costs a follow-up batch
 // pinned to the same block.
-func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, error) {
+func (r *viewRead) observe(ctx context.Context, at time.Time, hash string, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, error) {
 	if prior != nil {
 		r.dependents(ctx, prior.contracts, prior.snapshot.Round, payers, recipients)
 	}
@@ -381,7 +414,7 @@ func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, pr
 		if err != nil {
 			return nil, err
 		}
-		obs := &chainObservation{at: at, reference: r.reference, contracts: known, funds: deps.funds, active: deps.active}
+		obs := &chainObservation{at: at, block: hash, reference: r.reference, contracts: known, funds: deps.funds, active: deps.active}
 		obs.snapshot = ChainSnapshot{Block: block, Round: deps.round, RoundHash: deps.hash, blockReference: r.reference, observation: obs}
 		for key, info := range obs.funds {
 			info.Snapshot = obs.snapshot
