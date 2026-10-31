@@ -270,8 +270,8 @@ func TestPaidRequestRPCCalls(t *testing.T) {
 	path.rpc.Reset()
 	payment, segCreds := path.sign(t, info)
 	stats = path.rpc.Stats()
-	require.Equal(t, 14, stats.RoundTrips, "signer: payer funds (7), twice")
-	require.Equal(t, sum(snapshot, funds, snapshot, funds), stats.Calls)
+	require.Equal(t, 7, stats.RoundTrips, "signer: payer funds (7), reused by the batch recheck")
+	require.Equal(t, sum(snapshot, funds), stats.Calls)
 	require.Zero(t, stats.Unpinned)
 
 	path.rpc.Reset()

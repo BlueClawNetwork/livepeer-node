@@ -100,7 +100,11 @@ func (s *Service) preparePayment(ctx context.Context, paymentType, manifest stri
 	}
 	// Precheck one ticket before generating the batch.
 	// Observation/funding failures here are client errors.
-	if err := s.validateTicketParams(ctx, &params, 1, "precheck"); err != nil {
+	funds, err := s.observePayer(ctx, &params, "precheck")
+	if err == nil {
+		err = s.checkTicketParams(ctx, &params, 1, funds, "precheck")
+	}
+	if err != nil {
 		if errors.Is(err, pm.ErrRefreshRequired) {
 			return draftPayment{}, err
 		}
@@ -117,9 +121,10 @@ func (s *Service) preparePayment(ctx context.Context, paymentType, manifest stri
 		slog.With("component", "signer", "event", "payment", "operation", "payment").WarnContext(ctx, "signer ticket batch rejected", "outcome", "error", "error_kind", observability.ErrorKind(err))
 		return draftPayment{}, invalid("invalid ticket batch")
 	}
-	// Recheck the full batch before authorization. A later observation/funding failure
-	// is an internal generation failure; invalid exposure remains a client error.
-	if err := s.validateTicketParams(ctx, &params, count, "generation"); err != nil {
+	// Recheck the full batch before authorization, on the precheck's observation:
+	// only the ticket count differs. A funding failure here is an internal generation
+	// failure; invalid exposure remains a client error.
+	if err := s.checkTicketParams(ctx, &params, count, funds, "generation"); err != nil {
 		return draftPayment{}, err
 	}
 	batch, remaining, err := pm.DraftRemoteBatch(params, s.key.Address(), state.TicketNonce, fee, balance)
@@ -176,14 +181,6 @@ func (p draftPayment) Sign(ctx context.Context, signer pm.TicketSigner, metrics 
 	segment := p.segment
 	segment.Signature = sig
 	return signedPayment{Payment: base64.StdEncoding.EncodeToString(wire.EncodePayment(message)), SegCreds: base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))}, nil
-}
-
-func (s *Service) validateTicketParams(ctx context.Context, ticketParams *pm.TicketParams, numTickets int, phase string) error {
-	funds, err := s.observePayer(ctx, ticketParams, phase)
-	if err != nil {
-		return err
-	}
-	return s.checkTicketParams(ctx, ticketParams, numTickets, funds, phase)
 }
 
 func (s *Service) observePayer(ctx context.Context, ticketParams *pm.TicketParams, phase string) (pm.PayerFunds, error) {
