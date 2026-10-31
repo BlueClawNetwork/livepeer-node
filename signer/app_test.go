@@ -1,6 +1,7 @@
 package signer
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/j0sh/boa/pkg/boa"
 	"github.com/livepeer/node/internal/test"
+	"github.com/livepeer/node/pm/wire"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
@@ -75,6 +77,9 @@ func TestSignerConfigurationValidation(t *testing.T) {
 		{"zero discovery interval", func(p *Params) { p.DiscoveryRefreshInterval = 0 }, "discovery-refresh-interval"},
 		{"discovery failure threshold", func(p *Params) { p.DiscoveryMaxFailedRefreshes = -1 }, "discovery-max-failed-refreshes"},
 		{"invalid discovery grant", func(p *Params) { p.DiscoveryGrants = []string{"ftp://localhost"} }, "signer-discovery destination grant"},
+		{"negative chain refresh", func(p *Params) { p.ChainRefreshInterval = -time.Second }, "chain-refresh-interval"},
+		{"chain max age at the interval", func(p *Params) { p.ChainRefreshInterval, p.ChainMaxAge = time.Second, time.Second }, "chain-max-age"},
+		{"chain max age below the interval", func(p *Params) { p.ChainRefreshInterval, p.ChainMaxAge = time.Minute, time.Second }, "chain-max-age"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			p := validParams(t)
@@ -413,6 +418,109 @@ func TestSignerReadiness(t *testing.T) {
 			require.Equal(t, 200, get("/readyz"), "storage readiness recovers even while Kafka is unavailable")
 		})
 	}
+}
+
+func TestSignerServesPaymentsThroughTheChainView(t *testing.T) {
+	key, keyFile, passwordPath := testSignerKey(t)
+	_, info := testService(t)
+	info.TicketParams.ExpirationBlock = big.NewInt(5000).Bytes()
+	rpc := test.NewChainRPC(t)
+	rpc.Mine(func(state *test.ChainState) {
+		state.SetSender(key.Address(), test.ChainSender{Deposit: big.NewInt(1e18), Reserve: big.NewInt(1e18), WithdrawRound: new(big.Int)})
+	})
+	free := func() netip.AddrPort {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		address := l.Addr().(*net.TCPAddr).AddrPort()
+		require.NoError(t, l.Close())
+		return address
+	}
+	p := validParams(t)
+	p.KeystoreFile, p.KeystorePasswordFile, p.RPCURL, p.Controller, p.Orchestrators = keyFile, passwordPath, testURL(t, rpc.URL), rpc.Controller, nil
+	p.Listen, p.MetricsListen = free(), free()
+	p.ChainRefreshInterval, p.ChainMaxAge = 50*time.Millisecond, 400*time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, p) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Error("signer did not stop")
+		}
+	})
+	status := func(path string) int {
+		response, err := http.Get("http://" + p.MetricsListen.String() + path)
+		if err != nil {
+			return 0
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	pay := func() int {
+		body, err := json.Marshal(map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+		require.NoError(t, err)
+		response, err := http.Post("http://"+p.Listen.String()+"/generate-live-payment", "application/json", bytes.NewReader(body))
+		require.NoError(t, err)
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	require.Eventually(t, func() bool { return status("/readyz") == http.StatusOK }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, http.StatusOK, pay())
+	rpc.Reset()
+	for range 50 {
+		require.Equal(t, http.StatusOK, pay())
+	}
+	require.Less(t, rpc.Stats().Calls["TicketBroker.getSenderInfo"]+rpc.Stats().Calls["eth_getBlockByNumber"], 50, "a known payer reads the view")
+
+	rpc.SetDown(true)
+	require.Eventually(t, func() bool { return status("/readyz") == http.StatusServiceUnavailable }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, http.StatusBadRequest, pay(), "as a failed chain read answers")
+	require.Equal(t, http.StatusOK, status("/healthz"))
+	rpc.SetDown(false)
+	require.Eventually(t, func() bool { return status("/readyz") == http.StatusOK }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, http.StatusOK, pay())
+
+	response, err := http.Get("http://" + p.MetricsListen.String() + "/metrics")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	metrics, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	for _, family := range []string{"livepeer_chain_view_age_seconds", "livepeer_chain_view_tracked_payers", `livepeer_chain_view_refreshes_total{component="signer",outcome="error"}`, `livepeer_rpc_contract_calls_total{component="signer",contract="ticketBroker",function="getSenderInfo"}`, `livepeer_signer_payment_duration_seconds_count{component="signer",type="fixed"}`} {
+		require.Contains(t, string(metrics), family)
+	}
+}
+
+func TestSignerChainViewSettings(t *testing.T) {
+	parse := func(t *testing.T, config string, args ...string) Params {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "signer.toml")
+		require.NoError(t, os.WriteFile(path, []byte(config), 0600))
+		var p Params
+		cmd := boa.Cmd[Params]{Params: &p, RawArgs: append([]string{"--config", path, "--data-dir", t.TempDir(), "--max-hourly-price", "1", "--max-fixed-price", "1", "--wei-per-usd", "1"}, args...), RejectUnknown: true,
+			ParamEnrich: boa.ParamEnricherCombine(boa.ParamEnricherDefault, boa.ParamEnricherEnv, boa.ParamEnricherEnvPrefix("LIVEPEER_SIGNER")),
+			RunFuncE:    func(*Params, *cobra.Command, []string) error { return nil },
+		}
+		t.Setenv("LIVEPEER_SIGNER_RPC_URL", "http://localhost:8545")
+		t.Setenv("LIVEPEER_SIGNER_KEYSTORE_PASSWORD", "test")
+		require.NoError(t, cmd.RunArgsE(cmd.RawArgs))
+		return p
+	}
+	p := parse(t, "")
+	require.Equal(t, 5*time.Second, p.ChainRefreshInterval, "enabled by default")
+	require.Equal(t, 30*time.Second, p.ChainMaxAge)
+	p = parse(t, "ChainRefreshInterval = '2s'\nChainMaxAge = '10s'\n")
+	require.Equal(t, 2*time.Second, p.ChainRefreshInterval)
+	require.Equal(t, 10*time.Second, p.ChainMaxAge)
+	t.Setenv("LIVEPEER_SIGNER_CHAIN_MAX_AGE", "20s")
+	p = parse(t, "ChainMaxAge = '10s'\n", "--chain-refresh-interval", "0")
+	require.Zero(t, p.ChainRefreshInterval, "operators can opt out")
+	require.Equal(t, 20*time.Second, p.ChainMaxAge)
+	opted := validParams(t)
+	opted.ChainMaxAge = 0
+	require.NoError(t, opted.Validate(), "an interval of 0 needs no maximum age")
 }
 
 func TestStorageDefaultsAndChainCheck(t *testing.T) {

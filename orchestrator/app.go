@@ -65,6 +65,8 @@ type Params struct {
 	HealthGrants              []string      `optional:"true" descr:"Private static runner health IP[:port] or CIDR grants"`
 	HeartbeatInterval         time.Duration `default:"5s" descr:"Runner heartbeat interval"`
 	HeartbeatTTL              time.Duration `default:"30s" descr:"Runner heartbeat expiry"`
+	ChainRefreshInterval      time.Duration `default:"5s" descr:"Chain view refresh interval for paid requests; 0 reads the chain on every request"`
+	ChainMaxAge               time.Duration `default:"30s" descr:"Refuse paid requests when the chain view is older than this; must exceed chain-refresh-interval"`
 	PrintConfig               bool          `optional:"true" boa:"noconfig,noenv" descr:"Print audited redacted TOML configuration"`
 }
 
@@ -135,6 +137,9 @@ func (p Params) Validate() error {
 	if p.HeartbeatInterval <= 0 || p.HeartbeatTTL <= p.HeartbeatInterval {
 		return errors.New("--heartbeat-interval must be positive and --heartbeat-ttl must be greater than --heartbeat-interval")
 	}
+	if p.ChainRefreshInterval < 0 || (p.ChainRefreshInterval > 0 && p.ChainMaxAge <= p.ChainRefreshInterval) {
+		return errors.New("--chain-refresh-interval must be nonnegative and --chain-max-age must be greater than it; an interval of 0 reads the chain directly")
+	}
 	for _, item := range []struct {
 		purpose string
 		grants  []string
@@ -203,6 +208,7 @@ func printConfig(ctx *boa.HookContext, p *Params, out io.Writer) error {
 		"RedeemerDB": &p.RedeemerDB, "ChainID": &p.ChainID, "RedeemerMaxFeePerGas": &p.RedeemerMaxFeePerGas,
 		"Controller": &p.Controller, "WeiPerUSD": &p.WeiPerUSD, "ETHUSDFeed": &p.ETHUSDFeed,
 		"PriceMaxAge": &p.PriceMaxAge, "TicketFaceValue": &p.TicketFaceValue, "TicketWinProb": &p.TicketWinProb,
+		"ChainRefreshInterval": &p.ChainRefreshInterval, "ChainMaxAge": &p.ChainMaxAge,
 	}
 	for name, ptr := range values {
 		if !ctx.HasValue(ptr) {
@@ -257,9 +263,11 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	}
 	registry := NewRegistry(p.BootstrapSecret, p.ServiceURL.String(), p.HeartbeatInterval, p.HeartbeatTTL)
 	registry.runnerService = strings.TrimRight(p.RunnerServiceURL.String(), "/")
+	logger := slog.New(slog.NewTextHandler(logOut, nil))
 	var engine *PaymentEngine
 	var redeemerDB *RedeemerDB
 	var paymentChain eth.PaymentChain
+	var chainView *eth.ChainView
 	var redeemerKey *eth.Key
 	var paymentChainID *big.Int
 	if p.paymentsRequested() {
@@ -274,6 +282,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		}
 		defer rpc.Close()
 		rpc.SetObserver(registry.metrics.RPC)
+		rpc.SetCallObserver(registry.metrics.RPCCall)
 		paymentChainID = new(big.Int).SetUint64(*p.ChainID)
 		if err := rpc.CheckChainID(parent, paymentChainID); err != nil {
 			return fmt.Errorf("verify payment RPC chain ID (check LIVEPEER_ORCHESTRATOR_RPC_URL or --rpc-url-file, --chain-id and --network): %w", err)
@@ -304,13 +313,22 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		if p.OrchestratorAddress != nil {
 			recipient = *p.OrchestratorAddress
 		}
-		engine, err = NewPaymentEngine(redeemerDB, pm.EthereumChain{Client: paymentChain}, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
+		var engineChain pm.PaymentChain = pm.EthereumChain{Client: paymentChain}
+		if p.ChainRefreshInterval > 0 {
+			chainView, err = eth.NewChainView(paymentChain, eth.ChainViewOptions{Interval: p.ChainRefreshInterval, MaxAge: p.ChainMaxAge, Recipients: []ethcommon.Address{recipient},
+				OnRefresh: registry.metrics.ChainViewRefreshHook(logger.With("component", "orchestrator")), OnBatchFallback: registry.metrics.ChainViewBatchFallback})
+			if err != nil {
+				return fmt.Errorf("initialize chain view (check --chain-refresh-interval and --chain-max-age): %w", err)
+			}
+			registry.metrics.ChainView(chainView.Age, chainView.Tracked)
+			engineChain = chainView
+		}
+		engine, err = NewPaymentEngine(redeemerDB, engineChain, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
 		if err != nil {
 			return fmt.Errorf("initialize payment engine (check --account, --ticket-face-value and --ticket-win-prob): %w", err)
 		}
 	}
 	registry.proxyTemplate = p.ProxyURLTemplate
-	logger := slog.New(slog.NewTextHandler(logOut, nil))
 	registry.logger = logger.With("component", "orchestrator")
 	if err := loadStatic(p.RunnerConfig, registry); err != nil {
 		return fmt.Errorf("load static runners from %q (--runner-config or LIVEPEER_ORCHESTRATOR_RUNNER_CONFIG): %w", p.RunnerConfig, err)
@@ -320,6 +338,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	defer app.Close()
 	app.SetPayment(engine)
 	readiness := &paidReadiness{interval: p.HeartbeatInterval}
+	if chainView != nil {
+		readiness.view = chainView
+	}
 	if engine != nil {
 		registry.metrics.Gauge("redemption_last_success_timestamp_seconds", nil).Set(0)
 		registry.metrics.Gauge("redemption_worker_last_completed_timestamp_seconds", nil).Set(0)
@@ -384,6 +405,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	}
 	startWorker(p.HeartbeatInterval, time.Second, func(context.Context) { registry.Expire() })
 	workers.Go(func() { app.runO2RKeepalives(ctx, 10*time.Second) })
+	if chainView != nil {
+		workers.Go(func() { chainView.Run(ctx) })
+	}
 	if engine != nil {
 		startWorker(p.HeartbeatInterval, 30*time.Second, func(ctx context.Context) {
 			readiness.check(ctx, redeemerDB, paymentChain, engine, registry.metrics, logger)

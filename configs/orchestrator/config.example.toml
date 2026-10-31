@@ -37,6 +37,11 @@ HealthGrants = []
 # WeiPerUSD = "1000000000000000"
 # ETHUSDFeed = "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612" # Arbitrum default.
 # PriceMaxAge = "2h"
+# Paid requests read chain state from memory, refreshed on this timer, and are
+# refused when it is older than ChainMaxAge. An interval of 0 reads the chain on
+# every request instead.
+# ChainRefreshInterval = "5s"
+# ChainMaxAge = "30s"
 # Ticket EV is approximately 2e11 wei; a 100-ticket batch fits the signer
 # default 2e13 wei cap. Fund sufficient deposit and recipient-claimable reserve.
 # TicketFaceValue = "400000000000"

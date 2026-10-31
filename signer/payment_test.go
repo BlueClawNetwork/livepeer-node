@@ -180,17 +180,17 @@ type paidPath struct {
 
 // newViewedPaidPath gives the orchestrator and the signer a chain view each, as
 // separate processes have, and observes the chain once for each.
-func newViewedPaidPath(t testing.TB) *paidPath {
+func newViewedPaidPath(t testing.TB, now func() time.Time) *paidPath {
 	t.Helper()
-	return newPaidPathWith(t, true)
+	return newPaidPathWith(t, &eth.ChainViewOptions{Interval: 5 * time.Second, MaxAge: 30 * time.Second, Now: now})
 }
 
 func newPaidPath(t testing.TB) *paidPath {
 	t.Helper()
-	return newPaidPathWith(t, false)
+	return newPaidPathWith(t, nil)
 }
 
-func newPaidPathWith(t testing.TB, viewed bool) *paidPath {
+func newPaidPathWith(t testing.TB, viewOptions *eth.ChainViewOptions) *paidPath {
 	t.Helper()
 	payer, recipient := paidPathKey(t), ethcommon.HexToAddress("0x1234")
 	rpcServer := test.NewChainRPC(t)
@@ -210,10 +210,13 @@ func newPaidPathWith(t testing.TB, viewed bool) *paidPath {
 	path := &paidPath{rpc: rpcServer, payer: payer, recipient: recipient}
 	var orchestratorChain pm.PaymentChain = pm.EthereumChain{Client: direct}
 	var signerChain pm.PayerChain = pm.EthereumChain{Client: direct}
-	if viewed {
-		path.orchestratorView, err = eth.NewChainView(direct, eth.ChainViewOptions{Interval: 5 * time.Second, MaxAge: 30 * time.Second, Recipients: []ethcommon.Address{recipient}})
+	if viewOptions != nil {
+		options := *viewOptions
+		options.Recipients = []ethcommon.Address{recipient}
+		path.orchestratorView, err = eth.NewChainView(direct, options)
 		require.NoError(t, err)
-		path.signerView, err = eth.NewChainView(direct, eth.ChainViewOptions{Interval: 5 * time.Second, MaxAge: 30 * time.Second})
+		options.Recipients = nil
+		path.signerView, err = eth.NewChainView(direct, options)
 		require.NoError(t, err)
 		path.refresh(t)
 		orchestratorChain, signerChain = path.orchestratorView, path.signerView
@@ -268,6 +271,13 @@ func (p *paidPath) sign(t testing.TB, info wire.OrchestratorInfo) (payment, segC
 	return signed.Payment, signed.SegCreds
 }
 
+func (p *paidPath) trySign(info wire.OrchestratorInfo) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+	w := httptest.NewRecorder()
+	p.service.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/generate-live-payment", bytes.NewReader(body)))
+	return w
+}
+
 func (p *paidPath) receive(ctx context.Context, manifest, payment, segCreds string) error {
 	_, _, err := p.engine.Receive(ctx, "runner", manifest, payment, segCreds)
 	return err
@@ -312,8 +322,82 @@ func TestPaidRequestRPCCalls(t *testing.T) {
 	require.Zero(t, stats.Unpinned)
 }
 
+type pathClock struct{ elapsed atomic.Int64 }
+
+func (c *pathClock) Now() time.Time {
+	return time.Unix(1_900_000_000, c.elapsed.Load())
+}
+
+func (c *pathClock) Advance(elapsed time.Duration) { c.elapsed.Add(int64(elapsed)) }
+
+func TestSignerSeesPayerChangesWithinOneRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sender func(*test.ChainSender)
+	}{
+		{"deposit below the face value", func(sender *test.ChainSender) { sender.Deposit = big.NewInt(1) }},
+		{"no deposit", func(sender *test.ChainSender) { sender.Deposit = new(big.Int) }},
+		{"no reserve", func(sender *test.ChainSender) { sender.Reserve = new(big.Int) }},
+		{"unlocking", func(sender *test.ChainSender) { sender.WithdrawRound = big.NewInt(6) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newViewedPaidPath(t, nil)
+			info := path.challenge(t, t.Context(), path.manifest())
+			path.sign(t, info)
+			path.rpc.Mine(func(state *test.ChainState) {
+				sender := test.ChainSender{Deposit: big.NewInt(1e18), Reserve: big.NewInt(1e18), WithdrawRound: new(big.Int)}
+				tc.sender(&sender)
+				state.SetSender(path.payer.Address(), sender)
+			})
+			path.refresh(t)
+			before := test.MetricSum(t, path.service.metrics.Registry, "signer_payments_total", map[string]string{"outcome": "rejected"})
+			requirePaymentFailure(t, path.trySign(info), http.StatusBadRequest)
+			require.Equal(t, before+1, test.MetricSum(t, path.service.metrics.Registry, "signer_payments_total", map[string]string{"outcome": "rejected"}))
+		})
+	}
+}
+
+func TestRefusedChainViewFailsASignatureLikeAFailedChainRead(t *testing.T) {
+	direct := newPaidPath(t)
+	info := direct.challenge(t, t.Context(), direct.manifest())
+	direct.rpc.SetDown(true)
+	want := direct.trySign(info)
+	require.Equal(t, http.StatusBadRequest, want.Code, want.Body.String())
+
+	clock := new(pathClock)
+	path := newViewedPaidPath(t, clock.Now)
+	info = path.challenge(t, t.Context(), path.manifest())
+	path.sign(t, info)
+	clock.Advance(31 * time.Second)
+	got := path.trySign(info)
+	require.Equal(t, want.Code, got.Code)
+	require.JSONEq(t, want.Body.String(), got.Body.String(), "the same status and message")
+	require.EqualValues(t, 1, test.MetricSum(t, direct.service.metrics.Registry, "signer_payments_total", map[string]string{"outcome": "error"}))
+	require.EqualValues(t, 1, test.MetricSum(t, path.service.metrics.Registry, "signer_payments_total", map[string]string{"outcome": "error"}))
+	path.refresh(t)
+	path.sign(t, info)
+}
+
+// paramsExpiryBuffer leaves one L1 block between signing and expiry, measured on the
+// signer's own clock. A chain view holds that clock back: by under one L1 block at the
+// default interval, and by several as a failing view approaches its maximum age. The
+// signer can then sign parameters the orchestrator already refuses.
+func TestSignerExpiryBufferIsRelativeToItsObservedClock(t *testing.T) {
+	path := newViewedPaidPath(t, nil)
+	manifest := path.manifest()
+	info := path.challenge(t, t.Context(), manifest)
+	expiry := new(big.Int).SetBytes(info.TicketParams.ExpirationBlock).Int64()
+	path.sign(t, info)
+	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = expiry })
+	require.NoError(t, path.orchestratorView.Refresh(t.Context()))
+	payment, segCreds := path.sign(t, info)
+	require.ErrorIs(t, path.receive(t.Context(), manifest, payment, segCreds), orchestrator.ErrInvalidPayment, "the orchestrator's clock passed expiry")
+	require.NoError(t, path.signerView.Refresh(t.Context()))
+	require.Equal(t, 480, path.trySign(info).Code, "after its next observation the signer asks for a refresh")
+}
+
 func TestPaidRequestRPCBudgetWithChainView(t *testing.T) {
-	path := newViewedPaidPath(t)
+	path := newViewedPaidPath(t, nil)
 	roundTrips := func(t *testing.T, step func()) int {
 		t.Helper()
 		path.rpc.Reset()

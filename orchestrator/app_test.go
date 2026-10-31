@@ -246,6 +246,49 @@ RunnerGrants = ['10.0.0.0/8', 'fc00::/7']
 	}
 }
 
+func TestChainViewSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	printConfig := func(t *testing.T, args ...string) map[string]any {
+		t.Helper()
+		output, err := execute(t, append([]string{"--config", path, "--print-config"}, args...)...)
+		require.NoError(t, err)
+		var printed map[string]any
+		require.NoError(t, toml.Unmarshal([]byte(output), &printed))
+		return printed
+	}
+	require.NoError(t, os.WriteFile(path, nil, 0600))
+	printed := printConfig(t)
+	require.Equal(t, "5s", printed["ChainRefreshInterval"], "enabled by default")
+	require.Equal(t, "30s", printed["ChainMaxAge"])
+	require.NoError(t, os.WriteFile(path, []byte("ChainRefreshInterval = '2s'\nChainMaxAge = '10s'\n"), 0600))
+	printed = printConfig(t)
+	require.Equal(t, "2s", printed["ChainRefreshInterval"])
+	require.Equal(t, "10s", printed["ChainMaxAge"])
+	t.Setenv("LIVEPEER_ORCHESTRATOR_CHAIN_MAX_AGE", "20s")
+	printed = printConfig(t, "--chain-refresh-interval", "0")
+	require.Equal(t, "0s", printed["ChainRefreshInterval"], "operators can opt out")
+	require.Equal(t, "20s", printed["ChainMaxAge"])
+
+	valid := paymentKeystoreParams(t, "http://127.0.0.1:1")
+	valid.KeystorePassword = new("test")
+	require.NoError(t, valid.Validate(), "an interval of 0 needs no maximum age")
+	for _, tc := range []struct {
+		name             string
+		interval, maxAge time.Duration
+		want             string
+	}{
+		{"negative interval", -time.Second, time.Minute, "chain-refresh-interval"},
+		{"maximum age at the interval", time.Second, time.Second, "chain-max-age"},
+		{"maximum age below the interval", time.Minute, time.Second, "chain-max-age"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := valid
+			p.ChainRefreshInterval, p.ChainMaxAge = tc.interval, tc.maxAge
+			require.ErrorContains(t, p.Validate(), tc.want)
+		})
+	}
+}
+
 func TestLocalExampleConfig(t *testing.T) {
 	_, err := execute(t, "--config", "../configs/orchestrator/local.example.toml", "--print-config")
 	require.NoError(t, err)
@@ -559,4 +602,113 @@ func TestChainMismatchBeforeStorage(t *testing.T) {
 	p.RedeemerDB = filepath.Join(t.TempDir(), "missing", "payments.sqlite")
 	require.ErrorContains(t, Serve(t.Context(), p, io.Discard), "chain ID")
 	require.NoDirExists(t, filepath.Dir(p.RedeemerDB))
+}
+
+// chainViewHTTPParams starts a paid orchestrator's configuration against a counting RPC.
+func chainViewHTTPParams(t *testing.T, rpc *test.ChainRPC) (Params, string) {
+	t.Helper()
+	mainPort, metricsPort := freeTCPPort(t), freeTCPPort(t)
+	p := paymentKeystoreParams(t, rpc.URL)
+	p.HeartbeatInterval = 50 * time.Millisecond
+	p.KeystoreFile, p.KeystorePasswordFile = test.WriteFixedKeystore(t)
+	key, err := eth.OpenKeystoreFile(p.KeystoreFile, p.KeystorePasswordFile)
+	require.NoError(t, err)
+	rpc.Mine(func(state *test.ChainState) { state.SetActive(key.Address(), true) })
+	controller := rpc.Controller
+	p.Controller = &controller
+	p.Listen = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", mainPort))
+	p.MetricsListen = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", metricsPort))
+	p.ServiceURL = boa.Text[*url.URL]{Value: mustURL(t, "http://"+p.Listen.String())}
+	p.RunnerConfig = filepath.Join(t.TempDir(), "runners.toml")
+	require.NoError(t, os.WriteFile(p.RunnerConfig, []byte("[[Runners]]\nID = 'r'\nRunnerURL = 'https://runner.example'\nApp = 'test'\n[Runners.PriceInfo]\nPrice = 1\n"), 0600))
+	return p, "http://" + p.MetricsListen.String()
+}
+
+func serveForTest(t *testing.T, p Params) {
+	t.Helper()
+	require.NoError(t, p.Validate())
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, p, io.Discard) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Error("orchestrator did not stop")
+		}
+	})
+}
+
+func requestChallenge(t *testing.T, p Params) int {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, p.ServiceURL.String()+"/apps/r/session", nil)
+	require.NoError(t, err)
+	request.Header.Set("Livepeer-Payer-Address", ethcommon.HexToAddress("0x2000").Hex())
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return response.StatusCode
+}
+
+func requestStatus(t *testing.T, url string) int {
+	t.Helper()
+	response, err := http.Get(url)
+	if err != nil {
+		return 0
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return response.StatusCode
+}
+
+func TestPaidHTTPReadsThroughTheChainView(t *testing.T) {
+	rpc := test.NewChainRPC(t)
+	p, metrics := chainViewHTTPParams(t, rpc)
+	p.ChainRefreshInterval, p.ChainMaxAge = 50*time.Millisecond, 400*time.Millisecond
+	serveForTest(t, p)
+	require.Eventually(t, func() bool { return requestStatus(t, metrics+"/readyz") == http.StatusOK }, 7*time.Second, 10*time.Millisecond)
+
+	// Challenges add nothing to what the timers read.
+	rpc.Reset()
+	for range 50 {
+		require.Equal(t, http.StatusPaymentRequired, requestChallenge(t, p))
+	}
+	stats := rpc.Stats()
+	require.Less(t, stats.Calls["BondingManager.isActiveTranscoder"], 50, "a challenge reads the view")
+
+	// An RPC outage turns into refusal, and readiness says so.
+	rpc.SetDown(true)
+	require.Eventually(t, func() bool { return requestStatus(t, metrics+"/readyz") == http.StatusServiceUnavailable }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, http.StatusBadGateway, requestChallenge(t, p), "as a failed chain read answers")
+	rpc.SetDown(false)
+	require.Eventually(t, func() bool { return requestStatus(t, metrics+"/readyz") == http.StatusOK }, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, http.StatusPaymentRequired, requestChallenge(t, p))
+
+	response, err := http.Get(metrics + "/metrics")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	for _, family := range []string{"livepeer_chain_view_age_seconds", `livepeer_chain_view_refreshes_total{component="orchestrator",outcome="success"}`, `livepeer_chain_view_refreshes_total{component="orchestrator",outcome="error"}`, `livepeer_rpc_contract_calls_total{component="orchestrator",contract="controller",function="getContract"}`, `livepeer_rpc_requests_total{component="orchestrator",method="batch",outcome="success"}`, "livepeer_payment_operation_duration_seconds_count"} {
+		require.Contains(t, string(body), family)
+	}
+}
+
+func TestPaidHTTPWithoutAChainViewReadsDirectly(t *testing.T) {
+	rpc := test.NewChainRPC(t)
+	p, _ := chainViewHTTPParams(t, rpc)
+	p.HeartbeatInterval, p.HeartbeatTTL = time.Hour, 2*time.Hour // Quiet the timers.
+	require.Zero(t, p.ChainRefreshInterval)
+	serveForTest(t, p)
+	require.Eventually(t, func() bool { return requestChallenge(t, p) == http.StatusPaymentRequired }, 5*time.Second, 10*time.Millisecond)
+	rpc.Reset()
+	require.Equal(t, http.StatusPaymentRequired, requestChallenge(t, p))
+	stats := rpc.Stats()
+	require.Equal(t, 6, stats.RoundTrips, "a challenge reads the chain itself, as it did before chain views")
+	require.Zero(t, stats.Batches)
 }

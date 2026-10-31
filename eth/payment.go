@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -134,6 +135,15 @@ func roundBlockHash(ctx context.Context, caller bind.ContractCaller, address eth
 		return ethcommon.Hash{}, errors.New("invalid round block hash")
 	}
 	return ethcommon.Hash(hash), nil
+}
+
+// ObservedAt returns when this snapshot's block was read. A direct read is current;
+// a chain view's snapshot can be up to its maximum age old.
+func (s ChainSnapshot) ObservedAt() time.Time {
+	if s.observation != nil {
+		return s.observation.at
+	}
+	return time.Now()
 }
 
 // canonicalBlock returns a header's protocol L1 clock and the reference binding

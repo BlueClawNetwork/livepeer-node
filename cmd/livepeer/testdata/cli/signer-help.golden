@@ -45,6 +45,8 @@ Flags:
       --orchestrator-webhook-file string                  (env: LIVEPEER_SIGNER_ORCHESTRATOR_WEBHOOK_FILE)
       --orchestrator-webhook-headers-file string          (env: LIVEPEER_SIGNER_ORCHESTRATOR_WEBHOOK_HEADERS_FILE)
       --orchestrator-webhook-refresh-interval duration   Orchestrator webhook refresh interval; must be positive when enabled (env: LIVEPEER_SIGNER_ORCHESTRATOR_WEBHOOK_REFRESH_INTERVAL) (default 5m0s)
+      --chain-refresh-interval duration                  Chain view refresh interval for payments; 0 reads the chain on every request (env: LIVEPEER_SIGNER_CHAIN_REFRESH_INTERVAL) (default 5s)
+      --chain-max-age duration                           Refuse payments when the chain view is older than this; must exceed chain-refresh-interval (env: LIVEPEER_SIGNER_CHAIN_MAX_AGE) (default 30s)
   -h, --help                                             help for livepeer-signer
   -v, --version                                          version for livepeer-signer
 
