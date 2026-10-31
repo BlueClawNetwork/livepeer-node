@@ -78,6 +78,7 @@ type ChainSnapshot struct {
 	Round          *big.Int // Last initialized round.
 	RoundHash      ethcommon.Hash
 	blockReference map[string]any
+	observation    *chainObservation // Set when read through a ChainView.
 }
 
 func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {

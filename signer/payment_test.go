@@ -168,16 +168,29 @@ func TestRecipientReservesWinningLiabilityAcrossConcurrentSessions(t *testing.T)
 // paidPath is one paid request end to end against a counting JSON-RPC server:
 // the orchestrator's challenge, the signer's payment and the orchestrator's receipt.
 type paidPath struct {
-	rpc       *test.ChainRPC
-	engine    *orchestrator.PaymentEngine
-	service   *Service
-	payer     *eth.Key
-	recipient ethcommon.Address
-	direct    eth.PaymentChain
-	next      atomic.Int64
+	rpc              *test.ChainRPC
+	engine           *orchestrator.PaymentEngine
+	service          *Service
+	payer            *eth.Key
+	recipient        ethcommon.Address
+	orchestratorView *eth.ChainView
+	signerView       *eth.ChainView
+	next             atomic.Int64
+}
+
+// newViewedPaidPath gives the orchestrator and the signer a chain view each, as
+// separate processes have, and observes the chain once for each.
+func newViewedPaidPath(t testing.TB) *paidPath {
+	t.Helper()
+	return newPaidPathWith(t, true)
 }
 
 func newPaidPath(t testing.TB) *paidPath {
+	t.Helper()
+	return newPaidPathWith(t, false)
+}
+
+func newPaidPathWith(t testing.TB, viewed bool) *paidPath {
 	t.Helper()
 	payer, recipient := paidPathKey(t), ethcommon.HexToAddress("0x1234")
 	rpcServer := test.NewChainRPC(t)
@@ -194,15 +207,32 @@ func newPaidPath(t testing.TB) *paidPath {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 	direct := eth.PaymentChain{Contracts: contracts}
+	path := &paidPath{rpc: rpcServer, payer: payer, recipient: recipient}
+	var orchestratorChain pm.PaymentChain = pm.EthereumChain{Client: direct}
+	var signerChain pm.PayerChain = pm.EthereumChain{Client: direct}
+	if viewed {
+		path.orchestratorView, err = eth.NewChainView(direct, eth.ChainViewOptions{Interval: 5 * time.Second, MaxAge: 30 * time.Second, Recipients: []ethcommon.Address{recipient}})
+		require.NoError(t, err)
+		path.signerView, err = eth.NewChainView(direct, eth.ChainViewOptions{Interval: 5 * time.Second, MaxAge: 30 * time.Second})
+		require.NoError(t, err)
+		path.refresh(t)
+		orchestratorChain, signerChain = path.orchestratorView, path.signerView
+	}
 	maximum := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
 	// One ticket covers the price and almost never wins, keeping winner storage
 	// out of the measurements of chain reads.
-	engine, err := orchestrator.NewPaymentEngine(store, pm.EthereumChain{Client: direct}, recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
+	path.engine, err = orchestrator.NewPaymentEngine(store, orchestratorChain, recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
 	require.NoError(t, err)
-	service := newService(payer)
-	t.Cleanup(func() { _ = service.Close() })
-	service.SetPaymentChain(pm.EthereumChain{Client: direct})
-	return &paidPath{rpc: rpcServer, engine: engine, service: service, payer: payer, recipient: recipient, direct: direct}
+	path.service = newService(payer)
+	t.Cleanup(func() { _ = path.service.Close() })
+	path.service.SetPaymentChain(signerChain)
+	return path
+}
+
+func (p *paidPath) refresh(t testing.TB) {
+	t.Helper()
+	require.NoError(t, p.orchestratorView.Refresh(context.Background()))
+	require.NoError(t, p.signerView.Refresh(context.Background()))
 }
 
 func paidPathKey(t testing.TB) *eth.Key {
@@ -280,6 +310,35 @@ func TestPaidRequestRPCCalls(t *testing.T) {
 	require.Equal(t, 9, stats.RoundTrips, "receive: payer funds (7) + IsActiveAt (2)")
 	require.Equal(t, sum(snapshot, funds, isActive), stats.Calls)
 	require.Zero(t, stats.Unpinned)
+}
+
+func TestPaidRequestRPCBudgetWithChainView(t *testing.T) {
+	path := newViewedPaidPath(t)
+	roundTrips := func(t *testing.T, step func()) int {
+		t.Helper()
+		path.rpc.Reset()
+		step()
+		stats := path.rpc.Stats()
+		require.Zero(t, stats.Unpinned)
+		return stats.RoundTrips
+	}
+	for _, phase := range []struct {
+		name            string
+		sign, receive   int
+		refreshedBefore bool
+	}{{name: "new payer", sign: 2, receive: 2}, {name: "known payer"}, {name: "known payer after a refresh", refreshedBefore: true}} {
+		t.Run(phase.name, func(t *testing.T) {
+			if phase.refreshedBefore {
+				path.refresh(t)
+			}
+			manifest := path.manifest()
+			var info wire.OrchestratorInfo
+			require.Zero(t, roundTrips(t, func() { info = path.challenge(t, t.Context(), manifest) }), "the challenge reads no payer funds")
+			var payment, segCreds string
+			require.LessOrEqual(t, roundTrips(t, func() { payment, segCreds = path.sign(t, info) }), phase.sign)
+			require.LessOrEqual(t, roundTrips(t, func() { require.NoError(t, path.receive(t.Context(), manifest, payment, segCreds)) }), phase.receive)
+		})
+	}
 }
 
 // paidRequestLatency is a measurement rather than an assertion: RPC latency is
