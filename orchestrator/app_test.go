@@ -641,12 +641,15 @@ func serveForTest(t *testing.T, p Params) {
 	})
 }
 
+// A spare keep-alive connection would hold up server shutdown for five seconds.
+var chainViewTestClient = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 5 * time.Second}
+
 func requestChallenge(t *testing.T, p Params) int {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodPost, p.ServiceURL.String()+"/apps/r/session", nil)
 	require.NoError(t, err)
 	request.Header.Set("Livepeer-Payer-Address", ethcommon.HexToAddress("0x2000").Hex())
-	response, err := http.DefaultClient.Do(request)
+	response, err := chainViewTestClient.Do(request)
 	if err != nil {
 		return 0
 	}
@@ -657,7 +660,7 @@ func requestChallenge(t *testing.T, p Params) int {
 
 func requestStatus(t *testing.T, url string) int {
 	t.Helper()
-	response, err := http.Get(url)
+	response, err := chainViewTestClient.Get(url)
 	if err != nil {
 		return 0
 	}
@@ -689,7 +692,7 @@ func TestPaidHTTPReadsThroughTheChainView(t *testing.T) {
 	require.Eventually(t, func() bool { return requestStatus(t, metrics+"/readyz") == http.StatusOK }, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, http.StatusPaymentRequired, requestChallenge(t, p))
 
-	response, err := http.Get(metrics + "/metrics")
+	response, err := chainViewTestClient.Get(metrics + "/metrics")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)

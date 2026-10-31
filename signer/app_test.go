@@ -451,8 +451,10 @@ func TestSignerServesPaymentsThroughTheChainView(t *testing.T) {
 			t.Error("signer did not stop")
 		}
 	})
+	// A spare keep-alive connection would hold up server shutdown for five seconds.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 5 * time.Second}
 	status := func(path string) int {
-		response, err := http.Get("http://" + p.MetricsListen.String() + path)
+		response, err := client.Get("http://" + p.MetricsListen.String() + path)
 		if err != nil {
 			return 0
 		}
@@ -462,7 +464,7 @@ func TestSignerServesPaymentsThroughTheChainView(t *testing.T) {
 	pay := func() int {
 		body, err := json.Marshal(map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
 		require.NoError(t, err)
-		response, err := http.Post("http://"+p.Listen.String()+"/generate-live-payment", "application/json", bytes.NewReader(body))
+		response, err := client.Post("http://"+p.Listen.String()+"/generate-live-payment", "application/json", bytes.NewReader(body))
 		require.NoError(t, err)
 		defer response.Body.Close()
 		return response.StatusCode
@@ -483,7 +485,7 @@ func TestSignerServesPaymentsThroughTheChainView(t *testing.T) {
 	require.Eventually(t, func() bool { return status("/readyz") == http.StatusOK }, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, http.StatusOK, pay())
 
-	response, err := http.Get("http://" + p.MetricsListen.String() + "/metrics")
+	response, err := client.Get("http://" + p.MetricsListen.String() + "/metrics")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	metrics, err := io.ReadAll(response.Body)
