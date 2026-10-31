@@ -24,6 +24,7 @@ import (
 // nonces stay real-time on PaymentChain.
 type ChainView struct {
 	chain      PaymentChain
+	maxAge     time.Duration
 	now        func() time.Time
 	refreshing sync.Mutex // Observations run one at a time.
 
@@ -63,7 +64,7 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	if chain.Contracts == nil || options.Interval <= 0 || options.MaxAge <= options.Interval {
 		return nil, errors.New("chain view requires contracts, a positive interval and a greater maximum age")
 	}
-	v := &ChainView{chain: chain, now: options.Now, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
+	v := &ChainView{chain: chain, maxAge: options.MaxAge, now: options.Now, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
 	if v.now == nil {
 		v.now = time.Now
 	}
@@ -73,6 +74,8 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	return v, nil
 }
 
+// errChainViewUnavailable fails a read as a failed chain read does. The view holds
+// no observation, or only one past the maximum age.
 var errChainViewUnavailable = errors.New("chain observation unavailable")
 
 func (v *ChainView) observation(ctx context.Context) (*chainObservation, error) {
@@ -80,11 +83,16 @@ func (v *ChainView) observation(ctx context.Context) (*chainObservation, error) 
 		return nil, err
 	}
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.current == nil {
+	obs := v.current
+	v.mu.Unlock()
+	if obs == nil || v.expired(obs) {
 		return nil, errChainViewUnavailable
 	}
-	return v.current, nil
+	return obs, nil
+}
+
+func (v *ChainView) expired(obs *chainObservation) bool {
+	return v.now().Sub(obs.at) > v.maxAge
 }
 
 // Snapshot returns the current observation's block, round and round hash.
@@ -117,6 +125,9 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 	if obs == nil {
 		return false, errors.New("canonical snapshot required")
 	}
+	if v.expired(obs) {
+		return false, errChainViewUnavailable
+	}
 	v.mu.Lock()
 	v.recipients[recipient] = v.now()
 	active, ok := obs.active[recipient]
@@ -132,6 +143,9 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 	}
 	if err != nil {
 		return false, err
+	}
+	if v.expired(obs) {
+		return false, errChainViewUnavailable
 	}
 	v.mu.Lock()
 	obs.active[recipient] = active
@@ -162,6 +176,9 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 	}
 	if err != nil {
 		return SenderInfo{}, err
+	}
+	if v.expired(obs) {
+		return SenderInfo{}, errChainViewUnavailable
 	}
 	info.Snapshot = obs.snapshot
 	v.mu.Lock()

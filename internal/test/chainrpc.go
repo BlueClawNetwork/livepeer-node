@@ -118,6 +118,7 @@ type ChainRPC struct {
 	down       bool
 	batchMode  BatchMode
 	failCall   func(function string, input []byte) bool
+	onCall     func()
 	trips      int
 	batches    int
 	calls      map[string]int
@@ -245,6 +246,14 @@ func (c *ChainRPC) FailCalls(filter func(function string, input []byte) bool) {
 	c.failCall = filter
 }
 
+// OnCall runs a hook after the next eth_call is answered, so a test can change
+// the chain or the clock in the middle of a read. It runs once.
+func (c *ChainRPC) OnCall(hook func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onCall = hook
+}
+
 // ChainRPCStats counts traffic since the last Reset. RoundTrips are HTTP
 // requests, so a batch is one; Calls counts each JSON-RPC call inside them, by
 // method or Contract.function.
@@ -338,7 +347,18 @@ func chainRPCError(id json.RawMessage, code int, message string) map[string]any 
 
 func (c *ChainRPC) answer(request chainRPCRequest) map[string]any {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	hook := c.onCall
+	if request.Method != "eth_call" {
+		hook = nil
+	} else {
+		c.onCall = nil
+	}
+	defer func() {
+		c.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+	}()
 	result := func(value any) map[string]any {
 		return map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": value}
 	}

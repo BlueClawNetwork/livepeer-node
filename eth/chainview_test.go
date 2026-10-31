@@ -199,3 +199,61 @@ func TestChainViewReturnsCopies(t *testing.T) {
 	require.Equal(t, big.NewInt(1000), second.Snapshot.Block)
 	require.Equal(t, big.NewInt(5), second.Snapshot.Round)
 }
+
+func TestChainViewRefusesPastItsMaximumAgeAndRecovers(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, clock := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.NoError(t, view.Refresh(t.Context()))
+	held, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+
+	reads := func() map[string]error {
+		_, snapshot := view.Snapshot(t.Context())
+		_, funds := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+		_, newPayer := view.PayerFunds(t.Context(), ethcommon.HexToAddress("0x2001"), viewRecipientAddress)
+		_, active := view.IsActiveAt(t.Context(), viewRecipientAddress, held)
+		return map[string]error{"snapshot": snapshot, "funds": funds, "new payer": newPayer, "active": active}
+	}
+	requireReads := func(check func(error, ...any)) {
+		for name, err := range reads() {
+			check(err, name)
+		}
+	}
+
+	// A failed refresh keeps the last good observation, but only until the maximum age.
+	rpc.SetDown(true)
+	clock.Advance(20 * time.Second)
+	require.Error(t, view.Refresh(t.Context()))
+	rpc.SetDown(false)
+	requireReads(func(err error, name ...any) { require.NoError(t, err, name...) })
+	rpc.SetDown(true)
+	clock.Advance(10 * time.Second)
+	require.Error(t, view.Refresh(t.Context()))
+	_, err = view.Snapshot(t.Context())
+	require.NoError(t, err, "exactly the maximum age is still served")
+	clock.Advance(time.Nanosecond)
+	requireReads(func(err error, name ...any) { require.ErrorIs(t, err, errChainViewUnavailable, name...) })
+	rpc.Reset()
+	rpc.SetDown(false)
+	requireReads(func(err error, name ...any) { require.ErrorIs(t, err, errChainViewUnavailable, name...) })
+	require.Zero(t, rpc.Stats().RoundTrips, "a refused read does not reach the RPC")
+
+	rpc.Mine(func(state *test.ChainState) { state.L1Block = 1001 })
+	require.NoError(t, view.Refresh(t.Context()))
+	held, err = view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(1001), held.Block)
+	requireReads(func(err error, name ...any) { require.NoError(t, err, name...) })
+}
+
+func TestChainViewDiscardsAnInlineReadThatOutlivesTheMaximumAge(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, clock := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.OnCall(func() { clock.Advance(31 * time.Second) })
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.ErrorIs(t, err, errChainViewUnavailable)
+}
