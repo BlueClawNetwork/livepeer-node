@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -211,6 +213,19 @@ func TestStaleViewCannotAcceptTicketsOnceRedemptionCanRevealRandomness(t *testin
 	require.ErrorIs(t, receiveRecipientPayment(t, f.engine, f.key, info, 4), ErrInvalidPayment, "the observed clock has passed expiry too")
 }
 
+// paidReceiptStatus answers a payment as the orchestrator's HTTP routes do.
+func paidReceiptStatus(t *testing.T, e *PaymentEngine, key *ecdsa.PrivateKey, info wire.OrchestratorInfo) int {
+	t.Helper()
+	payment, segment := recipientPayment(t, key, info, 99)
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request.Header.Set("Livepeer-Payment", base64.StdEncoding.EncodeToString(wire.EncodePayment(payment)))
+	request.Header.Set("Livepeer-Segment", base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment)))
+	response := httptest.NewRecorder()
+	_, ok := (&Server{payment: e}).paidReceipt(response, request, "runner", priceInfo{Price: "1", Currency: "wei", Unit: "fixed"})
+	require.False(t, ok)
+	return response.Code
+}
+
 func TestRefusedChainViewFailsLikeAFailedChainRead(t *testing.T) {
 	f := newViewEngine(t)
 	info := f.params(t, "session")
@@ -231,6 +246,8 @@ func TestRefusedChainViewFailsLikeAFailedChainRead(t *testing.T) {
 	wantChallenge := paymentAppOutcome(directChallenge())
 	wantReceive := receiveRecipientPayment(t, direct, f.key, directInfo, 1)
 	require.Error(t, wantReceive)
+	wantStatus := paidReceiptStatus(t, direct, f.key, directInfo)
+	require.Equal(t, http.StatusBadRequest, wantStatus)
 
 	f.clock.Advance(31 * time.Second)
 	f.rpc.SetDown(false)
@@ -245,6 +262,7 @@ func TestRefusedChainViewFailsLikeAFailedChainRead(t *testing.T) {
 	require.Equal(t, paymentAppOutcome(wantReceive), paymentAppOutcome(err))
 	require.NotErrorIs(t, err, ErrInvalidPayment)
 	require.NotErrorIs(t, err, pm.ErrPayerUnavailable)
+	require.Equal(t, wantStatus, paidReceiptStatus(t, f.engine, f.key, info), "the same HTTP answer")
 
 	f.refresh(t)
 	require.NoError(t, receiveRecipientPayment(t, f.engine, f.key, info, 2), "and recovers once the view does")
