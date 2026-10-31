@@ -81,16 +81,10 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	if header.Hash == (ethcommon.Hash{}) || header.Number == nil {
-		return ChainSnapshot{}, errors.New("invalid chain header")
+	block, ref, err := canonicalBlock(header)
+	if err != nil {
+		return ChainSnapshot{}, err
 	}
-	clock := header.Number
-	if header.L1BlockNumber != nil {
-		clock = header.L1BlockNumber
-	}
-	block := new(big.Int).Set((*big.Int)(clock))
-	// Bind every read to the canonical block, including Controller resolution.
-	ref := map[string]any{"blockHash": header.Hash.Hex(), "requireCanonical": true}
 	address, err := c.Contracts.ResolveAt(ctx, ref, "roundsManager")
 	if err != nil {
 		return ChainSnapshot{}, err
@@ -104,8 +98,8 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	if !round.IsInt64() || round.Sign() <= 0 {
-		return ChainSnapshot{}, errors.New("invalid initialized round")
+	if err := validInitializedRound(round); err != nil {
+		return ChainSnapshot{}, err
 	}
 	hash, err := rounds.BlockHashForRound(opts, round)
 	if err != nil {
@@ -115,6 +109,26 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 		return ChainSnapshot{}, errors.New("invalid round block hash")
 	}
 	return ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref}, nil
+}
+
+// canonicalBlock returns a header's protocol L1 clock and the reference binding
+// every read to that canonical block, including Controller resolution.
+func canonicalBlock(header *miniHeader) (*big.Int, map[string]any, error) {
+	if header.Hash == (ethcommon.Hash{}) || header.Number == nil {
+		return nil, nil, errors.New("invalid chain header")
+	}
+	clock := header.Number
+	if header.L1BlockNumber != nil {
+		clock = header.L1BlockNumber
+	}
+	return new(big.Int).Set((*big.Int)(clock)), map[string]any{"blockHash": header.Hash.Hex(), "requireCanonical": true}, nil
+}
+
+func validInitializedRound(round *big.Int) error {
+	if !round.IsInt64() || round.Sign() <= 0 {
+		return errors.New("invalid initialized round")
+	}
+	return nil
 }
 
 // SenderInfo is a coherent view of a sender's collateral and the amount of
