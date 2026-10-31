@@ -24,16 +24,18 @@ import (
 // Only the payment path reads through a view. Redemption, receipts, finality and
 // nonces stay real-time on PaymentChain.
 type ChainView struct {
-	chain      PaymentChain
-	maxAge     time.Duration
-	now        func() time.Time
-	refreshing sync.Mutex // Observations run one at a time.
-	inline     singleflight.Group
+	chain           PaymentChain
+	maxAge          time.Duration
+	now             func() time.Time
+	onBatchFallback func()
+	refreshing      sync.Mutex // Observations run one at a time.
+	inline          singleflight.Group
 
 	mu         sync.Mutex
 	current    *chainObservation
 	payers     map[viewPayer]time.Time
 	recipients map[ethcommon.Address]time.Time
+	batchRetry time.Time // When to try batches again; zero while they are in use.
 }
 
 // ChainViewOptions configures a ChainView. Interval and MaxAge are required.
@@ -41,6 +43,7 @@ type ChainViewOptions struct {
 	Interval, MaxAge time.Duration
 	Recipients       []ethcommon.Address // Observed from the first refresh.
 	Now              func() time.Time    // Defaults to time.Now.
+	OnBatchFallback  func()              // Called when reads run sequentially because batches are refused.
 }
 
 // viewPayer is a payer and the recipient of its claimable reserve. A zero
@@ -67,7 +70,7 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	if chain.Contracts == nil || options.Interval <= 0 || options.MaxAge <= options.Interval {
 		return nil, errors.New("chain view requires contracts, a positive interval and a greater maximum age")
 	}
-	v := &ChainView{chain: chain, maxAge: options.MaxAge, now: options.Now, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
+	v := &ChainView{chain: chain, maxAge: options.MaxAge, now: options.Now, onBatchFallback: options.OnBatchFallback, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
 	if v.now == nil {
 		v.now = time.Now
 	}
@@ -80,6 +83,8 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 // errChainViewUnavailable fails a read as a failed chain read does. The view holds
 // no observation, or only one past the maximum age.
 var errChainViewUnavailable = errors.New("chain observation unavailable")
+
+const viewBatchRetry = 10 * time.Minute
 
 func (v *ChainView) observation(ctx context.Context) (*chainObservation, error) {
 	if err := ctx.Err(); err != nil {
@@ -235,6 +240,9 @@ func (v *ChainView) Refresh(ctx context.Context) error {
 		return err
 	}
 	v.mu.Lock()
+	if !v.batchRetry.IsZero() && at.After(v.batchRetry) {
+		v.batchRetry = time.Time{}
+	}
 	prior := v.current
 	payers := make([]viewPayer, 0, len(v.payers))
 	for key := range v.payers {
@@ -299,22 +307,89 @@ func (r *viewRead) CodeAt(context.Context, ethcommon.Address, *big.Int) ([]byte,
 	return nil, nil
 }
 
-// fetch reads the queued calls in one batch.
+// fetch reads the queued calls. A refused batch falls back to sequential reads,
+// still pinned to this read's block.
 func (r *viewRead) fetch(ctx context.Context) {
 	keys := r.pending
 	r.pending = nil
+	if r.view.batching() {
+		keys = r.fetchBatch(ctx, keys)
+		if len(keys) == 0 {
+			return
+		}
+		// A batch fails the same way during an outage or a reorg. Only a call that
+		// succeeds alone shows it was the batch being refused.
+		r.fetchOne(ctx, keys[0])
+		if failure := r.results[keys[0]].err; failure != nil {
+			for _, key := range keys[1:] {
+				r.results[key].err = failure
+			}
+			return
+		}
+		r.view.refuseBatches()
+		keys = keys[1:]
+	}
+	r.view.notifyFallback()
+	for _, key := range keys {
+		r.fetchOne(ctx, key)
+	}
+}
+
+// fetchBatch reads keys in one batch and returns those it got no answer for: all
+// of them unless some call got one, or those a provider left out of its response.
+func (r *viewRead) fetchBatch(ctx context.Context, keys []viewCallKey) []viewCallKey {
 	batch := make([]gethrpc.BatchElem, len(keys))
 	for i, key := range keys {
 		to := key.to
 		batch[i] = gethrpc.BatchElem{Method: "eth_call", Args: []any{map[string]any{"from": ethcommon.Address{}, "to": &to, "input": hexutil.Bytes(key.data)}, r.reference}, Result: &r.results[key].output}
 	}
-	err := r.view.chain.Contracts.RPC.ethereum.Client().BatchCallContext(ctx, batch)
-	for i, key := range keys {
-		if err == nil {
-			r.results[key].err = safeRPCError(batch[i].Error)
-		} else {
+	if err := r.view.chain.Contracts.RPC.ethereum.Client().BatchCallContext(ctx, batch); err != nil {
+		for _, key := range keys {
 			r.results[key].err = safeRPCError(err)
 		}
+		return keys
+	}
+	var missing []viewCallKey
+	failed := 0
+	for i, key := range keys {
+		r.results[key].err = safeRPCError(batch[i].Error)
+		if batch[i].Error != nil {
+			failed++
+		}
+		if errors.Is(batch[i].Error, gethrpc.ErrMissingBatchResponse) {
+			missing = append(missing, key)
+		}
+	}
+	if failed == len(keys) {
+		return keys
+	}
+	return missing
+}
+
+func (r *viewRead) fetchOne(ctx context.Context, key viewCallKey) {
+	to := key.to
+	output, err := r.view.chain.Contracts.callerAt(r.reference).CallContract(ctx, ethereum.CallMsg{To: &to, Data: []byte(key.data)}, nil)
+	call := r.results[key]
+	call.output, call.err = output, err
+}
+
+func (v *ChainView) batching() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.batchRetry.IsZero()
+}
+
+// refuseBatches stops batching until a later observation tries again. Only
+// observations try again, so a new payer's read keeps to its round trips.
+func (v *ChainView) refuseBatches() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.batchRetry = v.now().Add(viewBatchRetry)
+}
+
+func (v *ChainView) notifyFallback() {
+	if v.onBatchFallback != nil {
+		v.onBatchFallback()
 	}
 }
 

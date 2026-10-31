@@ -5,6 +5,7 @@ import (
 	"context"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -388,4 +389,87 @@ func TestChainViewCoreReadFailureFailsTheObservation(t *testing.T) {
 			require.Equal(t, before.Block, after.Block, "the last good observation stays current")
 		})
 	}
+}
+
+func TestChainViewFallsBackToSequentialWhenBatchesAreRefused(t *testing.T) {
+	for _, refusal := range []struct {
+		name string
+		mode test.BatchMode
+	}{{"HTTP status", test.BatchRefusedHTTP}, {"error object", test.BatchRefusedObject}, {"error per call", test.BatchRefusedEach}, {"missing responses", test.BatchTruncated}} {
+		t.Run(refusal.name, func(t *testing.T) {
+			rpc := fundedViewChain(t)
+			rpc.SetBatchMode(refusal.mode)
+			var fallbacks atomic.Int32
+			view, _ := newTestView(t, rpc, func(options *ChainViewOptions) {
+				options.OnBatchFallback = func() { fallbacks.Add(1) }
+			})
+			require.NoError(t, view.Refresh(t.Context()))
+			require.Positive(t, fallbacks.Load())
+			snapshot, err := view.Snapshot(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, big.NewInt(5), snapshot.Round)
+			require.Equal(t, test.ChainRoundHash(5), snapshot.RoundHash)
+
+			rpc.Reset()
+			funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+			require.NoError(t, err)
+			require.Equal(t, big.NewInt(7), funds.Reserve)
+			stats := rpc.Stats()
+			require.LessOrEqual(t, stats.RoundTrips, 2, "a new payer stays within its budget once a refusal is known")
+			require.Zero(t, stats.Batches)
+			require.Zero(t, stats.Unpinned)
+
+			rpc.Mine(func(state *test.ChainState) {
+				state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(4), Reserve: big.NewInt(5), WithdrawRound: new(big.Int)})
+			})
+			rpc.Reset()
+			before := fallbacks.Load()
+			require.NoError(t, view.Refresh(t.Context()))
+			stats = rpc.Stats()
+			require.Zero(t, stats.Batches, "a known refusal does not waste a round trip")
+			require.Zero(t, stats.Unpinned, "sequential reads stay pinned to one block")
+			require.Equal(t, before+1, fallbacks.Load())
+			rpc.Reset()
+			funds, err = view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+			require.NoError(t, err)
+			require.Equal(t, big.NewInt(4), funds.Deposit)
+			require.Zero(t, rpc.Stats().RoundTrips)
+		})
+	}
+}
+
+func TestChainViewOnlyCountsRefusedBatches(t *testing.T) {
+	rpc := fundedViewChain(t)
+	var fallbacks atomic.Int32
+	view, _ := newTestView(t, rpc, func(options *ChainViewOptions) {
+		options.OnBatchFallback = func() { fallbacks.Add(1) }
+	})
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.SetDown(true)
+	require.Error(t, view.Refresh(t.Context()), "an outage is not a refusal")
+	rpc.SetDown(false)
+	rpc.FailCalls(func(string, []byte) bool { return true })
+	require.Error(t, view.Refresh(t.Context()), "failing every call is not a refusal")
+	rpc.FailCalls(nil)
+	require.Zero(t, fallbacks.Load())
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.Equal(t, 1, rpc.Stats().Batches, "batches stay in use")
+}
+
+func TestChainViewTriesBatchesAgainLater(t *testing.T) {
+	rpc := fundedViewChain(t)
+	rpc.SetBatchMode(test.BatchRefusedHTTP)
+	view, clock := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.SetBatchMode(test.BatchAccepted)
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.Zero(t, rpc.Stats().Batches)
+	clock.Advance(viewBatchRetry + time.Second)
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	stats := rpc.Stats()
+	require.Equal(t, 1, stats.Batches)
+	require.Equal(t, 2, stats.RoundTrips)
 }
