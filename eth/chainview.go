@@ -119,11 +119,11 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 // far below that.
 const MaxChainViewAge = 2 * time.Minute
 
-// ChainViewL1Blocks returns how many L1 blocks a view of this age can be behind,
-// rounded up, for someone comparing its clock with one that may be ahead of it.
-func ChainViewL1Blocks(age time.Duration) int64 {
+// MaxL1BlocksBehind returns how many L1 blocks this view can be behind before it
+// refuses, rounded up, for someone comparing its clock with one that may be ahead.
+func (v *ChainView) MaxL1BlocksBehind() int64 {
 	const l1BlockTime = 12 * time.Second
-	return int64((age + l1BlockTime - 1) / l1BlockTime)
+	return int64((v.maxAge + l1BlockTime - 1) / l1BlockTime)
 }
 
 // errChainViewUnavailable fails a read as a failed chain read does. The view holds

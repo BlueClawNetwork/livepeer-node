@@ -58,13 +58,22 @@ type Service struct {
 	discoveryInterval time.Duration
 	orchWebhook       *orchestratorWebhook
 	paymentChain      pm.PayerChain
+	expiryMargin      int64 // L1 blocks the payment chain's clock can be behind.
 	payerPolicy       pm.PayerPolicy
 	pricePolicy       *pricePolicy
 	events            signedTicketSink
 	slots             chan struct{}
 }
 
-func (s *Service) SetPaymentChain(chain pm.PayerChain) { s.paymentChain = chain }
+// SetPaymentChain sets where funds and the L1 clock come from. A chain view's clock
+// can be behind the orchestrator's, so the signer then asks for fresh parameters that
+// much earlier, instead of signing ones the orchestrator has seen expire.
+func (s *Service) SetPaymentChain(chain pm.PayerChain) {
+	s.paymentChain, s.expiryMargin = chain, 0
+	if view, ok := chain.(interface{ MaxL1BlocksBehind() int64 }); ok {
+		s.expiryMargin = view.MaxL1BlocksBehind()
+	}
+}
 
 func (s *Service) SetPayerPolicy(policy pm.PayerPolicy) error {
 	if err := policy.Validate(); err != nil {

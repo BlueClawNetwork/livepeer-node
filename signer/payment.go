@@ -213,7 +213,7 @@ func (s *Service) observePayer(ctx context.Context, ticketParams *pm.TicketParam
 func (s *Service) checkTicketParams(ctx context.Context, ticketParams *pm.TicketParams, numTickets int, funds pm.PayerFunds, phase string) error {
 	latestL1Block := funds.Snapshot.Block
 	currentBuffer := new(big.Int).Sub(ticketParams.ExpirationBlock, latestL1Block).Int64()
-	if currentBuffer <= paramsExpiryBuffer {
+	if currentBuffer <= paramsExpiryBuffer+s.expiryMargin {
 		return pm.ErrRefreshRequired
 	}
 	if err := s.payerPolicy.Check(*ticketParams, numTickets, funds); err != nil {

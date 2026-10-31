@@ -382,18 +382,34 @@ func TestRefusedChainViewFailsASignatureLikeAFailedChainRead(t *testing.T) {
 // signer's own clock. A chain view holds that clock back: by under one L1 block at the
 // default interval, and by several as a failing view approaches its maximum age. The
 // signer can then sign parameters the orchestrator already refuses.
-func TestSignerExpiryBufferIsRelativeToItsObservedClock(t *testing.T) {
+func TestAStaleSignerStopsSigningBeforeTheOrchestratorRefuses(t *testing.T) {
 	path := newViewedPaidPath(t, nil)
+	behind := path.signerView.MaxL1BlocksBehind()
+	require.Equal(t, int64(3), behind, "30 seconds is at most three 12-second L1 blocks")
 	manifest := path.manifest()
 	info := path.challenge(t, t.Context(), manifest)
 	expiry := new(big.Int).SetBytes(info.TicketParams.ExpirationBlock).Int64()
-	path.sign(t, info)
-	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = expiry })
+	lastSigned := expiry - paramsExpiryBuffer - behind - 1
+	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = lastSigned })
+	require.NoError(t, path.signerView.Refresh(t.Context()))
+	// The orchestrator is as far ahead as the signer's view can be behind.
+	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = lastSigned + behind })
 	require.NoError(t, path.orchestratorView.Refresh(t.Context()))
 	payment, segCreds := path.sign(t, info)
-	require.ErrorIs(t, path.receive(t.Context(), manifest, payment, segCreds), orchestrator.ErrInvalidPayment, "the orchestrator's clock passed expiry")
+	require.NoError(t, path.receive(t.Context(), manifest, payment, segCreds), "the last payment it signs is still accepted")
 	require.NoError(t, path.signerView.Refresh(t.Context()))
-	require.Equal(t, 480, path.trySign(info).Code, "after its next observation the signer asks for a refresh")
+	require.Equal(t, 480, path.trySign(info).Code, "one block later it asks for a refresh")
+}
+
+func TestASignerWithoutAViewKeepsTheOriginalExpiryBuffer(t *testing.T) {
+	path := newPaidPath(t)
+	manifest := path.manifest()
+	info := path.challenge(t, t.Context(), manifest)
+	expiry := new(big.Int).SetBytes(info.TicketParams.ExpirationBlock).Int64()
+	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = expiry - paramsExpiryBuffer - 1 })
+	path.sign(t, info)
+	path.rpc.Mine(func(state *test.ChainState) { state.L1Block = expiry - paramsExpiryBuffer })
+	require.Equal(t, 480, path.trySign(info).Code)
 }
 
 func TestPaidRequestRPCBudgetWithChainView(t *testing.T) {
