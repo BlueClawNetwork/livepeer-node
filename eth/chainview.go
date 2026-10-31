@@ -45,13 +45,15 @@ type ChainView struct {
 	batchRetry time.Time // When to try batches again; zero while they are in use.
 }
 
-// Defaults bound what a flood of new addresses can cost: at most this many entries
-// are held, and at most this many reads of them run at once.
+// These limits bound what a flood of new addresses can cost: at most this many
+// entries are held, and at most this many reads of them run at once.
 const (
 	defaultViewEntries   = 1024
 	defaultViewIdleAfter = 10 * time.Minute
 	defaultViewBatchSize = 100
 	viewConcurrency      = 8
+	viewBatchRetry       = 10 * time.Minute
+	viewInlineTimeout    = 15 * time.Second // The RPC client's own request timeout.
 )
 
 // ChainViewOptions configures a ChainView. Interval and MaxAge are required.
@@ -116,8 +118,6 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 // no observation, or only one past the maximum age.
 var errChainViewUnavailable = errors.New("chain observation unavailable")
 
-const viewBatchRetry = 10 * time.Minute
-
 func (v *ChainView) observation(ctx context.Context) (*chainObservation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -153,6 +153,41 @@ func (i SenderInfo) clone() SenderInfo {
 	i.Snapshot = i.Snapshot.clone()
 	i.Deposit, i.Reserve, i.WithdrawRound = new(big.Int).Set(i.Deposit), new(big.Int).Set(i.Reserve), new(big.Int).Set(i.WithdrawRound)
 	return i
+}
+
+// touchViewEntry records a use, making room at the limit by evicting the entry
+// unused the longest. Scanning at the limit costs far less than the read it precedes.
+func touchViewEntry[K comparable](entries map[K]time.Time, key K, now time.Time, limit int) (evicted K, ok bool) {
+	if _, tracked := entries[key]; !tracked && len(entries) >= limit {
+		var oldest time.Time
+		for candidate, used := range entries {
+			if !ok || used.Before(oldest) {
+				evicted, oldest, ok = candidate, used, true
+			}
+		}
+		delete(entries, evicted)
+	}
+	entries[key] = now
+	return evicted, ok
+}
+
+func expireViewEntries[K comparable](entries map[K]time.Time, cutoff time.Time) []K {
+	keys := make([]K, 0, len(entries))
+	for key, used := range entries {
+		if used.Before(cutoff) {
+			delete(entries, key)
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// Tracked returns how many payers later observations will read.
+func (v *ChainView) Tracked() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.payers)
 }
 
 // IsActiveAt returns a recipient's status at the snapshot's own observation. A
@@ -199,32 +234,6 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 	return value.(bool), nil
 }
 
-// viewInlineTimeout matches the RPC client's own request timeout.
-const viewInlineTimeout = 15 * time.Second
-
-// readInline runs one read pinned to an observation's block, shared by concurrent
-// callers. It outlives a caller that gives up, since others may be waiting. Errors
-// are returned to those sharing the read and then forgotten.
-func (v *ChainView) readInline(ctx context.Context, obs *chainObservation, key string, read func(context.Context, *viewRead) (any, error)) (any, error) {
-	result := v.inline.DoChan(obs.block+"/"+key, func() (any, error) {
-		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), viewInlineTimeout)
-		defer cancel()
-		return read(readCtx, v.newRead(obs.reference))
-	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case outcome := <-result:
-		if outcome.Err != nil {
-			return nil, outcome.Err
-		}
-		if v.expired(obs) {
-			return nil, errChainViewUnavailable
-		}
-		return outcome.Val, nil
-	}
-}
-
 // PayerFunds returns a payer's funds from the current observation. An unseen payer
 // is read at that observation's block and joins later observations.
 func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.Address) (SenderInfo, error) {
@@ -263,6 +272,29 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 		return SenderInfo{}, err
 	}
 	return value.(SenderInfo).clone(), nil
+}
+
+// readInline runs one read pinned to an observation's block, shared by concurrent
+// callers. It outlives a caller that gives up, since others may be waiting. Errors
+// are returned to those sharing the read and then forgotten.
+func (v *ChainView) readInline(ctx context.Context, obs *chainObservation, key string, read func(context.Context, *viewRead) (any, error)) (any, error) {
+	result := v.inline.DoChan(obs.block+"/"+key, func() (any, error) {
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), viewInlineTimeout)
+		defer cancel()
+		return read(readCtx, v.newRead(obs.reference))
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case outcome := <-result:
+		if outcome.Err != nil {
+			return nil, outcome.Err
+		}
+		if v.expired(obs) {
+			return nil, errChainViewUnavailable
+		}
+		return outcome.Val, nil
+	}
 }
 
 // Run observes the chain now and then every interval until ctx ends.
@@ -373,41 +405,6 @@ type viewRead struct {
 
 func (v *ChainView) newRead(reference map[string]any) *viewRead {
 	return &viewRead{view: v, reference: reference, results: map[viewCallKey]*viewCall{}}
-}
-
-// touchViewEntry records a use, making room at the limit by evicting the entry
-// unused the longest. Scanning at the limit costs far less than the read it precedes.
-func touchViewEntry[K comparable](entries map[K]time.Time, key K, now time.Time, limit int) (evicted K, ok bool) {
-	if _, tracked := entries[key]; !tracked && len(entries) >= limit {
-		var oldest time.Time
-		for candidate, used := range entries {
-			if !ok || used.Before(oldest) {
-				evicted, oldest, ok = candidate, used, true
-			}
-		}
-		delete(entries, evicted)
-	}
-	entries[key] = now
-	return evicted, ok
-}
-
-func expireViewEntries[K comparable](entries map[K]time.Time, cutoff time.Time) []K {
-	keys := make([]K, 0, len(entries))
-	for key, used := range entries {
-		if used.Before(cutoff) {
-			delete(entries, key)
-			continue
-		}
-		keys = append(keys, key)
-	}
-	return keys
-}
-
-// Tracked returns how many payers later observations will read.
-func (v *ChainView) Tracked() int {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return len(v.payers)
 }
 
 func (r *viewRead) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big.Int) ([]byte, error) {
@@ -547,13 +544,16 @@ func (r *viewRead) funds(ctx context.Context, address ethcommon.Address, key vie
 	return senderFunds(ctx, r, address, key.payer, key.recipient)
 }
 
+// contracts resolves every address, queuing all three together.
 func (r *viewRead) contracts(ctx context.Context) (viewContracts, error) {
 	var known viewContracts
 	var failure error
-	for name, address := range map[string]*ethcommon.Address{"roundsManager": &known.rounds, "bondingManager": &known.bonding, "ticketBroker": &known.broker} {
+	for _, entry := range []struct {
+		name    string
+		address *ethcommon.Address
+	}{{"roundsManager", &known.rounds}, {"bondingManager", &known.bonding}, {"ticketBroker", &known.broker}} {
 		var err error
-		*address, err = r.view.chain.Contracts.resolveWith(ctx, r, name)
-		if err != nil {
+		if *entry.address, err = r.view.chain.Contracts.resolveWith(ctx, r, entry.name); err != nil {
 			failure = err
 		}
 	}
