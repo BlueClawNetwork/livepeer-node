@@ -10,7 +10,9 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -26,14 +28,19 @@ const maxRPCResponse = 1 << 20
 
 // RPC applies bounded HTTP transport and error redaction to geth's client.
 type RPC struct {
-	ethereum *ethclient.Client
-	http     *http.Client
-	observer func(string, time.Duration, error)
+	ethereum     *ethclient.Client
+	http         *http.Client
+	observer     func(string, time.Duration, error)
+	callObserver func(contract, function string)
 }
 
 // SetObserver installs a hook before the client is used. Observations contain
 // allowlisted methods and redacted errors, never RPC payloads or URLs.
 func (r *RPC) SetObserver(observer func(string, time.Duration, error)) { r.observer = observer }
+
+// SetCallObserver installs a hook before the client is used. It sees each eth_call,
+// including those inside a batch, as labels from a fixed table of selectors.
+func (r *RPC) SetCallObserver(observer func(contract, function string)) { r.callObserver = observer }
 
 func OpenRPC(endpoint string) (*RPC, error) {
 	u, err := destination.ParseURL(endpoint)
@@ -80,19 +87,19 @@ type boundedRPCTransport struct {
 func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Response, err error) {
 	observer := t.rpc.observer
 	var observed error
-	if observer != nil {
+	batch := false
+	if observer != nil || t.rpc.callObserver != nil {
 		start, method := time.Now(), "unknown"
 		if request.GetBody != nil {
 			if body, err := request.GetBody(); err == nil {
-				var envelope struct {
-					Method string `json:"method"`
+				var requests []rpcRequestEnvelope
+				requests, batch = decodeRPCRequests(body)
+				if batch {
+					method = "batch"
+				} else if len(requests) == 1 && observedRPCMethods[requests[0].Method] {
+					method = requests[0].Method
 				}
-				if json.NewDecoder(body).Decode(&envelope) == nil {
-					switch envelope.Method {
-					case "eth_chainId", "eth_call", "eth_getCode", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount", "eth_getTransactionReceipt", "eth_getTransactionByHash", "eth_getBlockByNumber", "eth_estimateGas", "eth_sendRawTransaction", "eth_maxPriorityFeePerGas", "eth_gasPrice":
-						method = envelope.Method
-					}
-				}
+				t.observeCalls(requests)
 				_ = body.Close()
 			}
 		}
@@ -100,7 +107,9 @@ func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Re
 			if err != nil {
 				observed = err
 			}
-			observer(method, time.Since(start), safeRPCError(observed))
+			if observer != nil {
+				observer(method, time.Since(start), safeRPCError(observed))
+			}
 		}()
 	}
 	response, err = t.RoundTripper.RoundTrip(request)
@@ -115,18 +124,104 @@ func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Re
 	if len(data) > maxRPCResponse {
 		return nil, errRPCResponseLimit
 	}
-	if observer != nil {
-		var envelope struct {
-			Error *struct {
-				Code int `json:"code"`
-			} `json:"error"`
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 || json.Unmarshal(data, &envelope) != nil || envelope.Error != nil {
-			observed = errors.New("ethereum RPC request failed")
-		}
+	if observer != nil && (response.StatusCode < 200 || response.StatusCode >= 300 || !rpcResponseSucceeded(data, batch)) {
+		observed = errors.New("ethereum RPC request failed")
 	}
 	response.Body = io.NopCloser(bytes.NewReader(data))
 	return response, nil
+}
+
+var observedRPCMethods = map[string]bool{"eth_chainId": true, "eth_call": true, "eth_getCode": true, "eth_blockNumber": true, "eth_getBalance": true, "eth_getTransactionCount": true, "eth_getTransactionReceipt": true, "eth_getTransactionByHash": true, "eth_getBlockByNumber": true, "eth_estimateGas": true, "eth_sendRawTransaction": true, "eth_maxPriorityFeePerGas": true, "eth_gasPrice": true}
+
+type rpcRequestEnvelope struct {
+	Method string            `json:"method"`
+	Params []json.RawMessage `json:"params"`
+}
+
+// decodeRPCRequests reads a request body, which is an array when it is a batch.
+func decodeRPCRequests(body io.Reader) ([]rpcRequestEnvelope, bool) {
+	var raw json.RawMessage
+	if json.NewDecoder(body).Decode(&raw) != nil {
+		return nil, false
+	}
+	if len(raw) > 0 && raw[0] == '[' {
+		var requests []rpcRequestEnvelope
+		_ = json.Unmarshal(raw, &requests)
+		return requests, true
+	}
+	var request rpcRequestEnvelope
+	if json.Unmarshal(raw, &request) != nil {
+		return nil, false
+	}
+	return []rpcRequestEnvelope{request}, false
+}
+
+func (t boundedRPCTransport) observeCalls(requests []rpcRequestEnvelope) {
+	if t.rpc.callObserver == nil {
+		return
+	}
+	for _, request := range requests {
+		if request.Method != "eth_call" {
+			continue
+		}
+		contract, function := "unknown", "unknown"
+		var call struct {
+			Input hexutil.Bytes `json:"input"`
+			Data  hexutil.Bytes `json:"data"`
+		}
+		if len(request.Params) > 0 && json.Unmarshal(request.Params[0], &call) == nil {
+			if len(call.Input) == 0 {
+				call.Input = call.Data
+			}
+			if len(call.Input) >= 4 {
+				if label, ok := contractCallLabels()[[4]byte(call.Input[:4])]; ok {
+					contract, function = label[0], label[1]
+				}
+			}
+		}
+		t.rpc.callObserver(contract, function)
+	}
+}
+
+// contractCallLabels is the fixed set of functions metrics name. It is built from
+// the bindings' own selectors; anything else is reported as unknown.
+var contractCallLabels = sync.OnceValue(func() map[[4]byte][2]string {
+	labels := map[[4]byte][2]string{}
+	for binding, functions := range map[string][]string{
+		"controller":     {"getContract"},
+		"roundsManager":  {"lastInitializedRound", "blockHashForRound"},
+		"bondingManager": {"isActiveTranscoder"},
+		"ticketBroker":   {"getSenderInfo", "claimableReserve", "usedTickets", "redeemWinningTicket"},
+		"priceFeed":      {"description", "decimals", "latestRoundData"},
+	} {
+		parsed, err := bindingMetadata[binding].GetAbi()
+		if err != nil {
+			continue
+		}
+		for _, function := range functions {
+			if method, ok := parsed.Methods[function]; ok {
+				labels[[4]byte(method.ID)] = [2]string{binding, function}
+			}
+		}
+	}
+	return labels
+})
+
+func rpcResponseSucceeded(data []byte, batch bool) bool {
+	type envelope struct {
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if batch {
+		var responses []envelope
+		if json.Unmarshal(data, &responses) != nil {
+			return false
+		}
+		return !slices.ContainsFunc(responses, func(response envelope) bool { return response.Error != nil })
+	}
+	var response envelope
+	return json.Unmarshal(data, &response) == nil && response.Error == nil
 }
 
 func (t boundedRPCTransport) CloseIdleConnections() {

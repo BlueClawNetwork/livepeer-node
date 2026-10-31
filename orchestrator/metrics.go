@@ -246,6 +246,11 @@ func (e *PaymentEngine) paymentLabels(runner, manifest string) observability.Lab
 	return e.identity(runner, manifest).Labels()
 }
 
+// observeDuration is deferred with its arguments taken at the start of an operation.
+func (e *PaymentEngine) observeDuration(operation string, start time.Time, labels observability.Labels) {
+	e.metrics.Observe("payment_operation_duration_seconds", time.Since(start).Seconds(), labels.With("operation", operation))
+}
+
 func (e *PaymentEngine) recordPayment(operation string, err error, labels observability.Labels) {
 	outcome := paymentOutcome(err)
 	e.metrics.Add("payment_operations_total", 1, labels.With("operation", operation).With("outcome", outcome))

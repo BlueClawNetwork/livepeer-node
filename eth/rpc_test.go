@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,4 +117,72 @@ func TestTerminalTicketErrorRetainsOnlyKnownClassification(t *testing.T) {
 	require.ErrorIs(t, safeRPCError(original), ErrTicketCreationRound)
 	require.Equal(t, "ticket creationRound does not have a block hash", safeRPCError(original).Error())
 	require.Equal(t, "ethereum RPC error -32000", safeRPCError(ticketRevertRPCError{message: "nonce too low https://user:password@rpc.example"}).Error())
+}
+
+func TestRPCObserverCountsBatchesOnceAndContractCallsEach(t *testing.T) {
+	rpc := fundedViewChain(t)
+	type observation struct {
+		method string
+		err    error
+	}
+	var mu sync.Mutex
+	var trips []observation
+	calls := map[[2]string]int{}
+	view, _ := newTestView(t, rpc, func(options *ChainViewOptions) {})
+	client := view.chain.Contracts.RPC
+	client.SetObserver(func(method string, _ time.Duration, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		trips = append(trips, observation{method, err})
+	})
+	client.SetCallObserver(func(contract, function string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[[2]string{contract, function}]++
+	})
+	require.NoError(t, view.Refresh(t.Context()))
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	mu.Lock()
+	trips, calls = nil, map[[2]string]int{}
+	mu.Unlock()
+	require.NoError(t, view.Refresh(t.Context()))
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []observation{{"eth_getBlockByNumber", nil}, {"batch", nil}}, trips, "an HTTP request counts once, and a batch response is not a failure")
+	require.Equal(t, map[[2]string]int{
+		{"controller", "getContract"}: 3, {"roundsManager", "lastInitializedRound"}: 1, {"roundsManager", "blockHashForRound"}: 1,
+		{"bondingManager", "isActiveTranscoder"}: 1, {"ticketBroker", "getSenderInfo"}: 1, {"ticketBroker", "claimableReserve"}: 1,
+	}, calls, "each call inside a batch counts")
+}
+
+func TestRPCObserverSeesDirectCallsAndFailedBatches(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	client := view.chain.Contracts.RPC
+	calls := map[[2]string]int{}
+	var failures []string
+	client.SetCallObserver(func(contract, function string) { calls[[2]string{contract, function}]++ })
+	client.SetObserver(func(method string, _ time.Duration, err error) {
+		if err != nil {
+			failures = append(failures, method)
+		}
+	})
+	_, err := view.chain.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, map[[2]string]int{{"controller", "getContract"}: 1, {"roundsManager", "lastInitializedRound"}: 1, {"roundsManager", "blockHashForRound"}: 1}, calls)
+	require.Empty(t, failures)
+
+	clear(calls)
+	var result string
+	_ = client.ethereum.Client().CallContext(t.Context(), &result, "eth_call", map[string]any{"to": viewPayerAddress, "input": "0xdeadbeef"}, "latest")
+	require.Equal(t, map[[2]string]int{{"unknown", "unknown"}: 1}, calls, "a selector outside the table cannot create labels")
+
+	rpc.FailCalls(func(string, []byte) bool { return true })
+	_ = view.Refresh(t.Context())
+	require.Contains(t, failures, "batch", "a batch holding an error is a failed observation")
+}
+
+func TestContractCallLabelsNameEveryFunction(t *testing.T) {
+	require.Len(t, contractCallLabels(), 11, "every listed function exists in its binding")
 }

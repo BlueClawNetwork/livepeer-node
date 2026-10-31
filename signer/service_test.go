@@ -541,6 +541,15 @@ func TestPaymentFailureStatuses(t *testing.T) {
 	}
 }
 
+func TestSigningDuration(t *testing.T) {
+	s, info := testService(t)
+	defer s.Close()
+	require.Equal(t, http.StatusOK, postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"}).Code)
+	s.SetPaymentChain(unavailablePayer{})
+	requirePaymentFailure(t, postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"}), 400)
+	require.EqualValues(t, 2, test.MetricSum(t, s.metrics.Registry, "signer_payment_duration_seconds", map[string]string{"type": "fixed"}))
+}
+
 func TestBatchRecheckReusesPrecheckObservation(t *testing.T) {
 	s, info := testService(t)
 	defer s.Close()
