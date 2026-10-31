@@ -31,8 +31,10 @@ type ChainView struct {
 	maxEntries      int
 	idleAfter       time.Duration
 	batchSize       int
+	interval        time.Duration
 	now             func() time.Time
 	onBatchFallback func()
+	onRefresh       func(string, time.Duration, error)
 	refreshing      sync.Mutex // Observations run one at a time.
 	inline          singleflight.Group
 
@@ -61,6 +63,9 @@ type ChainViewOptions struct {
 	BatchSize        int                 // Calls in one batch; defaults to 100.
 	Now              func() time.Time    // Defaults to time.Now.
 	OnBatchFallback  func()              // Called when reads run sequentially because batches are refused.
+	// OnRefresh reports each observation: success, partial when entries failed, or
+	// error. Errors are safe to log, as they are for every other chain read.
+	OnRefresh func(outcome string, elapsed time.Duration, err error)
 }
 
 // viewPayer is a payer and the recipient of its claimable reserve. A zero
@@ -88,7 +93,7 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	if chain.Contracts == nil || options.Interval <= 0 || options.MaxAge <= options.Interval {
 		return nil, errors.New("chain view requires contracts, a positive interval and a greater maximum age")
 	}
-	v := &ChainView{chain: chain, maxAge: options.MaxAge, maxEntries: options.MaxEntries, idleAfter: options.IdleAfter, batchSize: options.BatchSize, now: options.Now, onBatchFallback: options.OnBatchFallback, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
+	v := &ChainView{chain: chain, interval: options.Interval, maxAge: options.MaxAge, maxEntries: options.MaxEntries, idleAfter: options.IdleAfter, batchSize: options.BatchSize, now: options.Now, onBatchFallback: options.OnBatchFallback, onRefresh: options.OnRefresh, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
 	if v.now == nil {
 		v.now = time.Now
 	}
@@ -260,19 +265,64 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 	return value.(SenderInfo).clone(), nil
 }
 
+// Run observes the chain now and then every interval until ctx ends.
+func (v *ChainView) Run(ctx context.Context) {
+	ticker := time.NewTicker(v.interval)
+	defer ticker.Stop()
+	for {
+		// An observation that outlasts the maximum age could never be served.
+		observing, cancel := context.WithTimeout(ctx, v.maxAge)
+		_ = v.Refresh(observing)
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// Age returns the time since the current observation's block read began, and false
+// before the first observation.
+func (v *ChainView) Age() (time.Duration, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.current == nil {
+		return 0, false
+	}
+	return v.now().Sub(v.current.at), true
+}
+
 // Refresh reads one observation and publishes it. On failure the previous
 // observation stays current.
 func (v *ChainView) Refresh(ctx context.Context) error {
 	v.refreshing.Lock()
 	defer v.refreshing.Unlock()
+	start := time.Now()
+	failures, err := v.observe(ctx)
+	if v.onRefresh != nil {
+		outcome := "success"
+		switch {
+		case err != nil:
+			outcome = "error"
+		case failures > 0:
+			outcome = "partial"
+		}
+		v.onRefresh(outcome, time.Since(start), err)
+	}
+	return err
+}
+
+// observe publishes a new observation, returning how many entries it left out.
+func (v *ChainView) observe(ctx context.Context) (int, error) {
 	at := v.now()
 	header, err := v.chain.Contracts.RPC.header(ctx, "latest")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	block, reference, err := canonicalBlock(header)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	v.mu.Lock()
 	if !v.batchRetry.IsZero() && at.After(v.batchRetry) {
@@ -285,17 +335,17 @@ func (v *ChainView) Refresh(ctx context.Context) error {
 	// Keep reads monotonic behind a load balancer. The last observation ages out if
 	// the RPC stays behind it, and a reorg to a shorter chain catches up in blocks.
 	if prior != nil && (*big.Int)(header.Number).Cmp(prior.number) < 0 {
-		return errors.New("chain head moved behind the last observation")
+		return 0, errors.New("chain head moved behind the last observation")
 	}
-	obs, err := v.newRead(reference).observe(ctx, at, block, prior, payers, recipients)
+	obs, failures, err := v.newRead(reference).observe(ctx, at, block, prior, payers, recipients)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	obs.number, obs.block = (*big.Int)(header.Number), header.Hash.Hex()
 	v.mu.Lock()
 	v.current = obs
 	v.mu.Unlock()
-	return nil
+	return failures, nil
 }
 
 // errViewCallPending reports a call queued for the next batch.
@@ -564,7 +614,7 @@ const maxViewBatches = 3
 // observation fits one batch after the block read. Only results under the addresses
 // and round this block confirms are used; a wrong assumption costs a follow-up batch
 // pinned to the same block.
-func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, error) {
+func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, int, error) {
 	if prior != nil {
 		r.dependents(ctx, prior.contracts, prior.snapshot.Round, payers, recipients)
 	}
@@ -582,7 +632,7 @@ func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, pr
 			err = deps.err
 		}
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		obs := &chainObservation{at: at, reference: r.reference, contracts: known, funds: deps.funds, active: deps.active}
 		obs.snapshot = ChainSnapshot{Block: block, Round: deps.round, RoundHash: deps.hash, blockReference: r.reference, observation: obs}
@@ -590,6 +640,6 @@ func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, pr
 			info.Snapshot = obs.snapshot
 			obs.funds[key] = info
 		}
-		return obs, nil
+		return obs, deps.failures, nil
 	}
 }

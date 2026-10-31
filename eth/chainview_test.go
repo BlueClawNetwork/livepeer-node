@@ -763,3 +763,62 @@ func TestChainViewAgeRunsFromBeforeTheBlockRead(t *testing.T) {
 	_, err = view.Snapshot(t.Context())
 	require.ErrorIs(t, err, errChainViewUnavailable, "31 seconds passed since the block was asked for")
 }
+
+func TestChainViewRunObservesOnItsTimerUntilCancelled(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc, func(options *ChainViewOptions) {
+		options.Interval, options.MaxAge, options.Now = 20*time.Millisecond, time.Minute, nil
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		view.Run(ctx)
+	}()
+	require.Eventually(t, func() bool {
+		_, err := view.Snapshot(t.Context())
+		return err == nil
+	}, 5*time.Second, time.Millisecond, "the first observation does not wait for the timer")
+	rpc.Mine(func(state *test.ChainState) { state.L1Block = 1234 })
+	require.Eventually(t, func() bool {
+		snapshot, err := view.Snapshot(t.Context())
+		return err == nil && snapshot.Block.Int64() == 1234
+	}, 5*time.Second, time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop did not stop")
+	}
+	rpc.Reset()
+	time.Sleep(60 * time.Millisecond)
+	require.Zero(t, rpc.Stats().RoundTrips, "no reads after shutdown")
+}
+
+func TestChainViewReportsRefreshOutcomesAndAge(t *testing.T) {
+	rpc := fundedViewChain(t)
+	var outcomes []string
+	view, clock := newTestView(t, rpc, func(options *ChainViewOptions) {
+		options.OnRefresh = func(outcome string, elapsed time.Duration, err error) {
+			require.GreaterOrEqual(t, elapsed, time.Duration(0))
+			require.Equal(t, outcome == "error", err != nil)
+			outcomes = append(outcomes, outcome)
+		}
+	})
+	_, known := view.Age()
+	require.False(t, known, "no observation has no age")
+	require.NoError(t, view.Refresh(t.Context()))
+	clock.Advance(3 * time.Second)
+	age, known := view.Age()
+	require.True(t, known)
+	require.Equal(t, 3*time.Second, age)
+
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	rpc.FailCalls(func(_ string, input []byte) bool { return bytes.Contains(input, viewPayerAddress.Bytes()) })
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.FailCalls(nil)
+	rpc.SetDown(true)
+	require.Error(t, view.Refresh(t.Context()))
+	require.Equal(t, []string{"success", "partial", "error"}, outcomes)
+}
