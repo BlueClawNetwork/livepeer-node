@@ -190,18 +190,24 @@ func TestChainViewReturnsCopies(t *testing.T) {
 	rpc := fundedViewChain(t)
 	view, _ := newTestView(t, rpc)
 	require.NoError(t, view.Refresh(t.Context()))
-	first, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
 	require.NoError(t, err)
-	first.Deposit.SetInt64(-1)
-	first.Reserve.SetInt64(-1)
-	first.Snapshot.Block.SetInt64(-1)
-	first.Snapshot.Round.SetInt64(-1)
-	second, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
-	require.NoError(t, err)
-	require.Equal(t, big.NewInt(10), second.Deposit)
-	require.Equal(t, big.NewInt(7), second.Reserve)
-	require.Equal(t, big.NewInt(1000), second.Snapshot.Block)
-	require.Equal(t, big.NewInt(5), second.Snapshot.Round)
+	for range 2 {
+		funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+		require.NoError(t, err)
+		require.Equal(t, big.NewInt(10), funds.Deposit)
+		require.Equal(t, big.NewInt(7), funds.Reserve)
+		require.Equal(t, new(big.Int), funds.WithdrawRound)
+		require.Equal(t, big.NewInt(1000), funds.Snapshot.Block)
+		require.Equal(t, big.NewInt(5), funds.Snapshot.Round)
+		snapshot, err := view.Snapshot(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, big.NewInt(1000), snapshot.Block)
+		require.Equal(t, big.NewInt(5), snapshot.Round)
+		for _, value := range []*big.Int{funds.Deposit, funds.Reserve, funds.WithdrawRound, funds.Snapshot.Block, funds.Snapshot.Round, snapshot.Block, snapshot.Round} {
+			value.SetInt64(-1)
+		}
+	}
 }
 
 func TestChainViewRefusesPastItsMaximumAgeAndRecovers(t *testing.T) {
@@ -570,4 +576,190 @@ func TestChainViewDoesNotMoveBackwards(t *testing.T) {
 	require.Equal(t, big.NewInt(1001), funds.Snapshot.Block)
 	rpc.Rewind(head)
 	require.NoError(t, view.Refresh(t.Context()))
+}
+
+func TestChainViewSeesARoundRolloverWithinOneObservation(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.Mine(func(state *test.ChainState) { state.SetRound(6, test.ChainRoundHash(6)) })
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	stats := rpc.Stats()
+	require.Equal(t, 3, stats.RoundTrips, "a follow-up batch reads the new round's hash")
+	require.Zero(t, stats.Unpinned, "at the same block")
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(6), snapshot.Round)
+	require.Equal(t, test.ChainRoundHash(6), snapshot.RoundHash, "never the hash of the round before")
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.Equal(t, 2, rpc.Stats().RoundTrips, "the new round is the assumption from now on")
+}
+
+func TestChainViewSeesAContractAddressChangeWithinOneObservation(t *testing.T) {
+	moved := ethcommon.HexToAddress("0xb1")
+	for _, tc := range []struct {
+		contract string
+		change   func(*test.ChainState)
+		check    func(*testing.T, *ChainView)
+	}{
+		{"RoundsManager", func(state *test.ChainState) { state.SetRound(9, test.ChainRoundHash(9)) }, func(t *testing.T, view *ChainView) {
+			snapshot, err := view.Snapshot(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, big.NewInt(9), snapshot.Round)
+			require.Equal(t, test.ChainRoundHash(9), snapshot.RoundHash)
+		}},
+		{"BondingManager", func(state *test.ChainState) { state.SetActive(viewRecipientAddress, false) }, func(t *testing.T, view *ChainView) {
+			snapshot, err := view.Snapshot(t.Context())
+			require.NoError(t, err)
+			active, err := view.IsActiveAt(t.Context(), viewRecipientAddress, snapshot)
+			require.NoError(t, err)
+			require.False(t, active)
+		}},
+		{"TicketBroker", func(state *test.ChainState) {
+			state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(3), Reserve: big.NewInt(3), WithdrawRound: new(big.Int)})
+		}, func(t *testing.T, view *ChainView) {
+			funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+			require.NoError(t, err)
+			require.Equal(t, big.NewInt(3), funds.Deposit)
+		}},
+	} {
+		t.Run(tc.contract, func(t *testing.T) {
+			rpc := fundedViewChain(t)
+			view, _ := newTestView(t, rpc)
+			require.NoError(t, view.Refresh(t.Context()))
+			_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+			require.NoError(t, err)
+			require.NoError(t, view.Refresh(t.Context()))
+			rpc.Mine(func(state *test.ChainState) {
+				state.Move(tc.contract, moved)
+				tc.change(state)
+			})
+			rpc.Reset()
+			require.NoError(t, view.Refresh(t.Context()))
+			stats := rpc.Stats()
+			require.LessOrEqual(t, stats.RoundTrips, 4)
+			require.Zero(t, stats.Unpinned, "the follow-up reads are at the same block")
+			tc.check(t, view)
+			rpc.Reset()
+			require.NoError(t, view.Refresh(t.Context()))
+			require.Equal(t, 2, rpc.Stats().RoundTrips)
+			tc.check(t, view)
+		})
+	}
+}
+
+func TestChainViewSeesAnAddressAndRoundChangeInTheSameBlock(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.Mine(func(state *test.ChainState) {
+		state.Move("RoundsManager", ethcommon.HexToAddress("0xb1"))
+		state.SetRound(9, test.ChainRoundHash(9))
+	})
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.LessOrEqual(t, rpc.Stats().RoundTrips, 4)
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(9), snapshot.Round)
+	require.Equal(t, test.ChainRoundHash(9), snapshot.RoundHash)
+}
+
+func TestChainViewSeesFundsDropAndAnUnlockWithinOneObservation(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	rpc.Mine(func(state *test.ChainState) {
+		state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(1), Reserve: big.NewInt(2), WithdrawRound: big.NewInt(7)})
+	})
+	require.NoError(t, view.Refresh(t.Context()))
+	funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(1), funds.Deposit)
+	require.Equal(t, big.NewInt(2), funds.Reserve)
+	require.Equal(t, big.NewInt(7), funds.WithdrawRound)
+}
+
+func TestChainViewKeepsItsObservationThroughAReorg(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.NoError(t, view.Refresh(t.Context()))
+	before, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	beforeFunds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+
+	// The block read returns a head that is orphaned before its calls run.
+	rpc.Mine(func(state *test.ChainState) { state.L1Block = 2000 })
+	rpc.OnBlockRead(func() {
+		rpc.Reorg(func(state *test.ChainState) {
+			state.L1Block = 2001
+			state.SetRound(6, test.ChainRoundHash(6))
+			state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(1), Reserve: big.NewInt(1), WithdrawRound: new(big.Int)})
+		})
+	})
+	require.Error(t, view.Refresh(t.Context()), "requireCanonical rejects the orphaned block")
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, before.Block, snapshot.Block, "nothing from the orphaned block was published")
+	require.Equal(t, before.Round, snapshot.Round)
+	funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, beforeFunds.Deposit, funds.Deposit)
+
+	require.NoError(t, view.Refresh(t.Context()), "the next observation reads the new head")
+	snapshot, err = view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(2001), snapshot.Block)
+	require.Equal(t, big.NewInt(6), snapshot.Round)
+	funds, err = view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(1), funds.Deposit)
+}
+
+func TestChainViewAbandonsAFollowUpBatchAfterAReorg(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.Mine(func(state *test.ChainState) {
+		state.L1Block = 2000
+		state.SetRound(6, test.ChainRoundHash(6))
+	})
+	rpc.OnCall(func() { rpc.Reorg(nil) }) // During the first batch, before its follow-up.
+	require.Error(t, view.Refresh(t.Context()))
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(5), snapshot.Round, "half an observation is never published")
+}
+
+func TestChainViewNewPayerReadFailsOnAnOrphanedBlock(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.Reorg(nil)
+	_, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.Error(t, err, "a read pinned to a block that lost canonicality is not served")
+	require.NoError(t, view.Refresh(t.Context()))
+	_, err = view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+}
+
+func TestChainViewAgeRunsFromBeforeTheBlockRead(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, clock := newTestView(t, rpc)
+	rpc.OnBlockRead(func() { clock.Advance(20 * time.Second) })
+	require.NoError(t, view.Refresh(t.Context()))
+	clock.Advance(10 * time.Second)
+	_, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	clock.Advance(time.Second)
+	_, err = view.Snapshot(t.Context())
+	require.ErrorIs(t, err, errChainViewUnavailable, "31 seconds passed since the block was asked for")
 }

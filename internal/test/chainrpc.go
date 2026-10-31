@@ -107,23 +107,24 @@ func (s *ChainState) Move(contract string, address common.Address) {
 // Reads pinned to a block hash see that block's state and fail once the block
 // is no longer canonical, so a test can observe mixed-block reads directly.
 type ChainRPC struct {
-	URL        string
-	Controller common.Address
-	mu         sync.Mutex
-	blocks     map[common.Hash]*ChainState
-	head       common.Hash
-	orphaned   map[common.Hash]bool
-	nextHash   uint64
-	latency    time.Duration
-	down       bool
-	batchMode  BatchMode
-	failCall   func(function string, input []byte) bool
-	onCall     func()
-	trips      int
-	batches    int
-	calls      map[string]int
-	unpinned   int
-	batchSizes []int
+	URL         string
+	Controller  common.Address
+	mu          sync.Mutex
+	blocks      map[common.Hash]*ChainState
+	head        common.Hash
+	orphaned    map[common.Hash]bool
+	nextHash    uint64
+	latency     time.Duration
+	down        bool
+	batchMode   BatchMode
+	failCall    func(function string, input []byte) bool
+	onCall      func()
+	onBlockRead func()
+	trips       int
+	batches     int
+	calls       map[string]int
+	unpinned    int
+	batchSizes  []int
 }
 
 const chainRPCController = "0x00000000000000000000000000000000000c0001"
@@ -254,6 +255,13 @@ func (c *ChainRPC) OnCall(hook func()) {
 	c.onCall = hook
 }
 
+// OnBlockRead runs a hook after the next eth_getBlockByNumber is answered. It runs once.
+func (c *ChainRPC) OnBlockRead(hook func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onBlockRead = hook
+}
+
 // ChainRPCStats counts traffic since the last Reset. RoundTrips are HTTP
 // requests, so a batch is one; Calls counts each JSON-RPC call inside them, by
 // method or Contract.function.
@@ -347,11 +355,12 @@ func chainRPCError(id json.RawMessage, code int, message string) map[string]any 
 
 func (c *ChainRPC) answer(request chainRPCRequest) map[string]any {
 	c.mu.Lock()
-	hook := c.onCall
-	if request.Method != "eth_call" {
-		hook = nil
-	} else {
-		c.onCall = nil
+	var hook func()
+	switch request.Method {
+	case "eth_call":
+		hook, c.onCall = c.onCall, nil
+	case "eth_getBlockByNumber":
+		hook, c.onBlockRead = c.onBlockRead, nil
 	}
 	defer func() {
 		c.mu.Unlock()
