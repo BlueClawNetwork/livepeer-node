@@ -33,7 +33,11 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if err != nil {
 		return false, err
 	}
-	bonding, err := contracts.NewBondingManagerCaller(address, c.Contracts.callerAt(snapshot.blockReference))
+	return activeTranscoder(ctx, c.Contracts.callerAt(snapshot.blockReference), address, recipient)
+}
+
+func activeTranscoder(ctx context.Context, caller bind.ContractCaller, address, recipient ethcommon.Address) (bool, error) {
+	bonding, err := contracts.NewBondingManagerCaller(address, caller)
 	if err != nil {
 		return false, err
 	}
@@ -89,26 +93,46 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	rounds, err := contracts.NewRoundsManagerCaller(address, c.Contracts.callerAt(ref))
+	caller := c.Contracts.callerAt(ref)
+	round, err := initializedRound(ctx, caller, address)
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	opts := &bind.CallOpts{Context: ctx}
-	round, err := rounds.LastInitializedRound(opts)
+	hash, err := roundBlockHash(ctx, caller, address, round)
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	if err := validInitializedRound(round); err != nil {
-		return ChainSnapshot{}, err
-	}
-	hash, err := rounds.BlockHashForRound(opts, round)
+	return ChainSnapshot{Block: block, Round: round, RoundHash: hash, blockReference: ref}, nil
+}
+
+func initializedRound(ctx context.Context, caller bind.ContractCaller, address ethcommon.Address) (*big.Int, error) {
+	rounds, err := contracts.NewRoundsManagerCaller(address, caller)
 	if err != nil {
-		return ChainSnapshot{}, err
+		return nil, err
+	}
+	round, err := rounds.LastInitializedRound(&bind.CallOpts{Context: ctx})
+	if err != nil {
+		return nil, err
+	}
+	if !round.IsInt64() || round.Sign() <= 0 {
+		return nil, errors.New("invalid initialized round")
+	}
+	return round, nil
+}
+
+func roundBlockHash(ctx context.Context, caller bind.ContractCaller, address ethcommon.Address, round *big.Int) (ethcommon.Hash, error) {
+	rounds, err := contracts.NewRoundsManagerCaller(address, caller)
+	if err != nil {
+		return ethcommon.Hash{}, err
+	}
+	hash, err := rounds.BlockHashForRound(&bind.CallOpts{Context: ctx}, round)
+	if err != nil {
+		return ethcommon.Hash{}, err
 	}
 	if hash == ([32]byte{}) {
-		return ChainSnapshot{}, errors.New("invalid round block hash")
+		return ethcommon.Hash{}, errors.New("invalid round block hash")
 	}
-	return ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref}, nil
+	return ethcommon.Hash(hash), nil
 }
 
 // canonicalBlock returns a header's protocol L1 clock and the reference binding
@@ -122,13 +146,6 @@ func canonicalBlock(header *miniHeader) (*big.Int, map[string]any, error) {
 		clock = header.L1BlockNumber
 	}
 	return new(big.Int).Set((*big.Int)(clock)), map[string]any{"blockHash": header.Hash.Hex(), "requireCanonical": true}, nil
-}
-
-func validInitializedRound(round *big.Int) error {
-	if !round.IsInt64() || round.Sign() <= 0 {
-		return errors.New("invalid initialized round")
-	}
-	return nil
 }
 
 // SenderInfo is a coherent view of a sender's collateral and the amount of
@@ -151,7 +168,16 @@ func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommo
 	if err != nil {
 		return SenderInfo{}, err
 	}
-	broker, err := contracts.NewTicketBrokerCaller(address, c.Contracts.callerAt(snapshot.blockReference))
+	info, err := senderFunds(ctx, c.Contracts.callerAt(snapshot.blockReference), address, sender, recipient)
+	if err != nil {
+		return SenderInfo{}, err
+	}
+	info.Snapshot = snapshot
+	return info, nil
+}
+
+func senderFunds(ctx context.Context, caller bind.ContractCaller, address, sender, recipient ethcommon.Address) (SenderInfo, error) {
+	broker, err := contracts.NewTicketBrokerCaller(address, caller)
 	if err != nil {
 		return SenderInfo{}, err
 	}
@@ -167,7 +193,7 @@ func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommo
 			return SenderInfo{}, err
 		}
 	}
-	return SenderInfo{Snapshot: snapshot, Deposit: info.Sender.Deposit, Reserve: reserve, WithdrawRound: info.Sender.WithdrawRound}, nil
+	return SenderInfo{Deposit: info.Sender.Deposit, Reserve: reserve, WithdrawRound: info.Sender.WithdrawRound}, nil
 }
 
 // The redemption tuple follows Yondon Fu's go-livepeer/eth/client_ticketbroker.go

@@ -72,6 +72,10 @@ func (c *Contracts) Resolve(ctx context.Context, name string) (ethcommon.Address
 }
 
 func (c *Contracts) ResolveAt(ctx context.Context, block any, name string) (ethcommon.Address, error) {
+	return c.resolveWith(ctx, c.callerAt(block), name)
+}
+
+func (c *Contracts) resolveWith(ctx context.Context, caller bind.ContractCaller, name string) (ethcommon.Address, error) {
 	if _, ok := c.abis[name]; !ok {
 		return ethcommon.Address{}, errors.New("unsupported contract")
 	}
@@ -82,7 +86,7 @@ func (c *Contracts) ResolveAt(ctx context.Context, block any, name string) (ethc
 	if contractName == "" {
 		return ethcommon.Address{}, errors.New("contract requires an explicit address")
 	}
-	controller, err := contracts.NewControllerCaller(c.Controller, c.callerAt(block))
+	controller, err := contracts.NewControllerCaller(c.Controller, caller)
 	if err != nil {
 		return ethcommon.Address{}, err
 	}
