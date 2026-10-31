@@ -467,11 +467,84 @@ func benchmarkPaidRequests(b *testing.B, path *paidPath, workers int) {
 	b.ReportMetric(float64(latencies[len(latencies)*99/100].Milliseconds()), "p99_ms")
 }
 
+// run keeps both views current until the test ends, as their refresh loops do.
+func (p *paidPath) run(t testing.TB) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var loops sync.WaitGroup
+	loops.Go(func() { p.orchestratorView.Run(ctx) })
+	loops.Go(func() { p.signerView.Run(ctx) })
+	t.Cleanup(func() {
+		cancel()
+		loops.Wait()
+	})
+}
+
+// The direct path is the interval-0 configuration: 22 round trips since the signer
+// stopped reading funds twice. The commit introducing this benchmark measured 29.
+//
 // Run with: go test ./signer -run '^$' -bench '^BenchmarkPaidRequest$' -benchtime 64x
 func BenchmarkPaidRequest(b *testing.B) {
 	for _, workers := range []int{1, 32} {
 		b.Run("direct/workers="+strconv.Itoa(workers), func(b *testing.B) {
 			benchmarkPaidRequests(b, newPaidPath(b), workers)
 		})
+		b.Run("view/workers="+strconv.Itoa(workers), func(b *testing.B) {
+			path := newViewedPaidPath(b, nil)
+			path.run(b)
+			path.request(b, context.Background()) // A known payer, as after the first request.
+			benchmarkPaidRequests(b, path, workers)
+		})
 	}
+}
+
+// RPC load must follow the chain view's timer, not request volume. The interval is
+// shortened so the comparison settles in seconds rather than minutes.
+func TestRPCRateStaysFlatUnderLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("measures load over several seconds")
+	}
+	const window = 2 * time.Second
+	path := newPaidPathWith(t, &eth.ChainViewOptions{Interval: 100 * time.Millisecond, MaxAge: time.Minute})
+	path.run(t)
+	path.request(t, t.Context())
+	measure := func(load func(stop <-chan struct{})) (trips, calls float64) {
+		path.rpc.Reset()
+		stop := make(chan struct{})
+		var workers sync.WaitGroup
+		if load != nil {
+			for range 16 {
+				workers.Go(func() { load(stop) })
+			}
+		}
+		time.Sleep(window)
+		stats := path.rpc.Stats()
+		close(stop)
+		workers.Wait()
+		total := 0
+		for _, count := range stats.Calls {
+			total += count
+		}
+		return float64(stats.RoundTrips) / window.Seconds(), float64(total) / window.Seconds()
+	}
+	idleTrips, idleCalls := measure(nil)
+	var requests atomic.Int64
+	loadedTrips, loadedCalls := measure(func(stop <-chan struct{}) {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				path.request(t, t.Context())
+				requests.Add(1)
+			}
+		}
+	})
+	rate := float64(requests.Load()) / window.Seconds()
+	t.Logf("idle: %.1f round trips/s, %.1f calls/s", idleTrips, idleCalls)
+	t.Logf("%.0f requests/s: %.1f round trips/s, %.1f calls/s", rate, loadedTrips, loadedCalls)
+	require.Greater(t, rate, 20.0, "the direct path would need 22 round trips for each of these")
+	require.Positive(t, idleTrips)
+	require.LessOrEqual(t, loadedTrips, idleTrips*1.25, "round trips do not grow with requests")
+	require.LessOrEqual(t, loadedCalls, idleCalls*1.25, "nor do the calls inside them")
 }
