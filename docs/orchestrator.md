@@ -131,6 +131,11 @@ Challenges, balances, and replay guards live in memory; restart requires new
 paid sessions. Winning tickets and transaction identities survive in SQLite.
 See [payment recovery](payment-recovery.md) for backup and reconciliation.
 
+Challenges and receipts read chain state from an in-memory
+[chain view](configuration.md#chain-reads-for-payments), not from the RPC on each
+request. A stale view refuses them, answering as a failed chain read does: 502 for
+a challenge, 400 for a payment. Redemption always reads the chain directly.
+
 ## Resource limits
 
 Paid `/readyz` returns 503 until payment dependencies and the redemption worker

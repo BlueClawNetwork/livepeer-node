@@ -206,6 +206,12 @@ curl -fsS http://127.0.0.1:8938/metrics
 See [metrics and operational events](metrics.md) for readiness requirements,
 metric definitions, and query/alert examples.
 
+Payments and readiness read chain state from an in-memory
+[chain view](configuration.md#chain-reads-for-payments), so a known payer costs no
+RPC calls per payment. A stale view refuses payments as a failed chain read does,
+with HTTP 400, and fails readiness. A payment for a new recipient reads its reserve
+inline.
+
 Monitor backlog, errors, and filesystem space.
 
 Replicas with the same key and authorization configuration can continue
