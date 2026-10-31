@@ -350,7 +350,9 @@ type viewDependents struct {
 	hash   ethcommon.Hash
 	active map[ethcommon.Address]bool
 	funds  map[viewPayer]SenderInfo
-	err    error
+	// err is a failed round read, which fails the observation.
+	err      error
+	failures int
 }
 
 // dependents reads everything behind the given addresses. An assumed round stands
@@ -367,10 +369,12 @@ func (r *viewRead) dependents(ctx context.Context, known viewContracts, assumed 
 			deps.err = err
 		}
 	}
+	// A failure for one entry only leaves it unobserved: its next read goes to the
+	// RPC and reports the error, and other payers are unaffected.
 	for _, recipient := range recipients {
 		active, err := activeTranscoder(ctx, r, known.bonding, recipient)
 		if err != nil {
-			deps.err = err
+			deps.failures++
 			continue
 		}
 		deps.active[recipient] = active
@@ -378,7 +382,7 @@ func (r *viewRead) dependents(ctx context.Context, known viewContracts, assumed 
 	for _, key := range payers {
 		info, err := r.funds(ctx, known.broker, key)
 		if err != nil {
-			deps.err = err
+			deps.failures++
 			continue
 		}
 		deps.funds[key] = info

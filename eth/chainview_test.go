@@ -1,6 +1,7 @@
 package eth
 
 import (
+	"bytes"
 	"context"
 	"math/big"
 	"sync"
@@ -328,4 +329,63 @@ func TestChainViewCancelledCallerLeavesASharedReadRunning(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-failed, context.Canceled)
 	require.NoError(t, <-second)
+}
+
+func TestChainViewOneFailingEntryDoesNotFailTheObservation(t *testing.T) {
+	rpc := fundedViewChain(t)
+	badPayer, badRecipient := ethcommon.HexToAddress("0x2bad"), ethcommon.HexToAddress("0x3bad")
+	view, _ := newTestView(t, rpc, func(options *ChainViewOptions) {
+		options.Recipients = append(options.Recipients, badRecipient)
+	})
+	require.NoError(t, view.Refresh(t.Context()))
+	for _, payer := range []ethcommon.Address{viewPayerAddress, badPayer} {
+		_, err := view.PayerFunds(t.Context(), payer, viewRecipientAddress)
+		require.NoError(t, err)
+	}
+	reverting := func(_ string, input []byte) bool {
+		return bytes.Contains(input, badPayer.Bytes()) || bytes.Contains(input, badRecipient.Bytes())
+	}
+	rpc.FailCalls(reverting)
+	rpc.Mine(func(state *test.ChainState) {
+		state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(4), Reserve: big.NewInt(5), WithdrawRound: new(big.Int)})
+	})
+	require.NoError(t, view.Refresh(t.Context()), "a contract revert for one payer cannot refuse every other payer")
+
+	rpc.Reset()
+	snapshot, err := view.Snapshot(t.Context())
+	require.NoError(t, err)
+	funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(4), funds.Deposit, "other payers are still current")
+	active, err := view.IsActiveAt(t.Context(), viewRecipientAddress, snapshot)
+	require.NoError(t, err)
+	require.True(t, active)
+	require.Zero(t, rpc.Stats().RoundTrips)
+
+	_, err = view.PayerFunds(t.Context(), badPayer, viewRecipientAddress)
+	require.Error(t, err, "the failure surfaces to that payer, as a direct read would")
+	_, err = view.IsActiveAt(t.Context(), badRecipient, snapshot)
+	require.Error(t, err)
+
+	rpc.FailCalls(nil)
+	_, err = view.PayerFunds(t.Context(), badPayer, viewRecipientAddress)
+	require.NoError(t, err)
+}
+
+func TestChainViewCoreReadFailureFailsTheObservation(t *testing.T) {
+	for _, function := range []string{"Controller.getContract", "RoundsManager.lastInitializedRound", "RoundsManager.blockHashForRound"} {
+		t.Run(function, func(t *testing.T) {
+			rpc := fundedViewChain(t)
+			view, _ := newTestView(t, rpc)
+			require.NoError(t, view.Refresh(t.Context()))
+			before, err := view.Snapshot(t.Context())
+			require.NoError(t, err)
+			rpc.FailCalls(func(name string, _ []byte) bool { return name == function })
+			rpc.Mine(func(state *test.ChainState) { state.L1Block = 2000 })
+			require.Error(t, view.Refresh(t.Context()))
+			after, err := view.Snapshot(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, before.Block, after.Block, "the last good observation stays current")
+		})
+	}
 }
