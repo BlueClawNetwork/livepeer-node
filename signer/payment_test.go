@@ -1,13 +1,19 @@
 package signer
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,4 +163,172 @@ func TestRecipientReservesWinningLiabilityAcrossConcurrentSessions(t *testing.T)
 	count, err := store.WinningTicketCount(key.Address(), 0)
 	require.NoError(t, err)
 	require.Equal(t, 2, count, "rejected batches must roll back tickets and credit")
+}
+
+// paidPath is one paid request end to end against a counting JSON-RPC server:
+// the orchestrator's challenge, the signer's payment and the orchestrator's receipt.
+type paidPath struct {
+	rpc       *test.ChainRPC
+	engine    *orchestrator.PaymentEngine
+	service   *Service
+	payer     *eth.Key
+	recipient ethcommon.Address
+	direct    eth.PaymentChain
+	next      atomic.Int64
+}
+
+func newPaidPath(t testing.TB) *paidPath {
+	t.Helper()
+	payer, recipient := paidPathKey(t), ethcommon.HexToAddress("0x1234")
+	rpcServer := test.NewChainRPC(t)
+	rpcServer.Mine(func(state *test.ChainState) {
+		state.SetActive(recipient, true)
+		state.SetSender(payer.Address(), test.ChainSender{Deposit: big.NewInt(1e18), Reserve: big.NewInt(1e18), WithdrawRound: new(big.Int)})
+	})
+	client, err := eth.OpenRPC(rpcServer.URL)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	contracts, err := eth.NewContracts(client, rpcServer.Controller)
+	require.NoError(t, err)
+	store, err := orchestrator.OpenRedeemerDB(filepath.Join(t.TempDir(), "payments.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	direct := eth.PaymentChain{Contracts: contracts}
+	maximum := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	// One ticket covers the price and almost never wins, keeping winner storage
+	// out of the measurements of chain reads.
+	engine, err := orchestrator.NewPaymentEngine(store, pm.EthereumChain{Client: direct}, recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
+	require.NoError(t, err)
+	service := newService(payer)
+	t.Cleanup(func() { _ = service.Close() })
+	service.SetPaymentChain(pm.EthereumChain{Client: direct})
+	return &paidPath{rpc: rpcServer, engine: engine, service: service, payer: payer, recipient: recipient, direct: direct}
+}
+
+func paidPathKey(t testing.TB) *eth.Key {
+	t.Helper()
+	keyFile, passwordPath := test.WriteKeystore(t, nil)
+	key, err := eth.OpenKeystoreFile(keyFile, passwordPath)
+	require.NoError(t, err)
+	return key
+}
+
+func (p *paidPath) manifest() string {
+	return "session-" + strconv.FormatInt(p.next.Add(1), 10)
+}
+
+func (p *paidPath) challenge(t testing.TB, ctx context.Context, manifest string) wire.OrchestratorInfo {
+	t.Helper()
+	_, err := p.engine.MakeChallenge(ctx, "runner", manifest, p.payer.Address(), 9, "fixed", "https://orch.example")
+	require.NoError(t, err)
+	info, err := p.engine.ChallengeInfo(manifest)
+	require.NoError(t, err)
+	return info
+}
+
+func (p *paidPath) sign(t testing.TB, info wire.OrchestratorInfo) (payment, segCreds string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+	require.NoError(t, err)
+	w := httptest.NewRecorder()
+	p.service.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/generate-live-payment", bytes.NewReader(body)))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var signed paymentResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &signed))
+	return signed.Payment, signed.SegCreds
+}
+
+func (p *paidPath) receive(ctx context.Context, manifest, payment, segCreds string) error {
+	_, _, err := p.engine.Receive(ctx, "runner", manifest, payment, segCreds)
+	return err
+}
+
+// The expected log is the one derived from the code in the issue this test pins.
+func TestPaidRequestRPCCalls(t *testing.T) {
+	path := newPaidPath(t)
+	manifest := path.manifest()
+	snapshot := map[string]int{"eth_getBlockByNumber": 1, "Controller.getContract": 1, "RoundsManager.lastInitializedRound": 1, "RoundsManager.blockHashForRound": 1}
+	isActive := map[string]int{"Controller.getContract": 1, "BondingManager.isActiveTranscoder": 1}
+	funds := map[string]int{"Controller.getContract": 1, "TicketBroker.getSenderInfo": 1, "TicketBroker.claimableReserve": 1}
+	sum := func(parts ...map[string]int) map[string]int {
+		total := map[string]int{}
+		for _, part := range parts {
+			for name, count := range part {
+				total[name] += count
+			}
+		}
+		return total
+	}
+
+	path.rpc.Reset()
+	info := path.challenge(t, t.Context(), manifest)
+	stats := path.rpc.Stats()
+	require.Equal(t, 6, stats.RoundTrips, "challenge: snapshot (4) + IsActiveAt (2)")
+	require.Equal(t, sum(snapshot, isActive), stats.Calls)
+	require.Zero(t, stats.Unpinned)
+
+	path.rpc.Reset()
+	payment, segCreds := path.sign(t, info)
+	stats = path.rpc.Stats()
+	require.Equal(t, 14, stats.RoundTrips, "signer: payer funds (7), twice")
+	require.Equal(t, sum(snapshot, funds, snapshot, funds), stats.Calls)
+	require.Zero(t, stats.Unpinned)
+
+	path.rpc.Reset()
+	require.NoError(t, path.receive(t.Context(), manifest, payment, segCreds))
+	stats = path.rpc.Stats()
+	require.Equal(t, 9, stats.RoundTrips, "receive: payer funds (7) + IsActiveAt (2)")
+	require.Equal(t, sum(snapshot, funds, isActive), stats.Calls)
+	require.Zero(t, stats.Unpinned)
+}
+
+// paidRequestLatency is a measurement rather than an assertion: RPC latency is
+// injected, so the result shows how the round trips of a request add up.
+const paidRequestLatency = 110 * time.Millisecond
+
+func (p *paidPath) request(t testing.TB, ctx context.Context) {
+	t.Helper()
+	manifest := p.manifest()
+	info := p.challenge(t, ctx, manifest)
+	payment, segCreds := p.sign(t, info)
+	require.NoError(t, p.receive(ctx, manifest, payment, segCreds))
+}
+
+func benchmarkPaidRequests(b *testing.B, path *paidPath, workers int) {
+	path.rpc.SetLatency(paidRequestLatency)
+	path.rpc.Reset()
+	var (
+		next      atomic.Int64
+		mu        sync.Mutex
+		latencies []time.Duration
+		running   sync.WaitGroup
+	)
+	b.ResetTimer()
+	for range workers {
+		running.Go(func() {
+			for next.Add(1) <= int64(b.N) {
+				start := time.Now()
+				path.request(b, context.Background())
+				elapsed := time.Since(start)
+				mu.Lock()
+				latencies = append(latencies, elapsed)
+				mu.Unlock()
+			}
+		})
+	}
+	running.Wait()
+	b.StopTimer()
+	slices.Sort(latencies)
+	b.ReportMetric(float64(path.rpc.Stats().RoundTrips)/float64(b.N), "rpc_trips/op")
+	b.ReportMetric(float64(latencies[len(latencies)/2].Milliseconds()), "p50_ms")
+	b.ReportMetric(float64(latencies[len(latencies)*99/100].Milliseconds()), "p99_ms")
+}
+
+// Run with: go test ./signer -run '^$' -bench '^BenchmarkPaidRequest$' -benchtime 64x
+func BenchmarkPaidRequest(b *testing.B) {
+	for _, workers := range []int{1, 32} {
+		b.Run("direct/workers="+strconv.Itoa(workers), func(b *testing.B) {
+			benchmarkPaidRequests(b, newPaidPath(b), workers)
+		})
+	}
 }
