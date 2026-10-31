@@ -496,6 +496,20 @@ func BenchmarkPaidRequest(b *testing.B) {
 			benchmarkPaidRequests(b, path, workers)
 		})
 	}
+	// Only the views are current here: the signer and the receipt each read this payer once.
+	b.Run("view/new payer", func(b *testing.B) {
+		trips := 0
+		for range b.N {
+			b.StopTimer()
+			path := newViewedPaidPath(b, nil)
+			path.rpc.SetLatency(paidRequestLatency)
+			path.rpc.Reset()
+			b.StartTimer()
+			path.request(b, context.Background())
+			trips += path.rpc.Stats().RoundTrips
+		}
+		b.ReportMetric(float64(trips)/float64(b.N), "rpc_trips/op")
+	})
 }
 
 // RPC load must follow the chain view's timer, not request volume. The interval is
