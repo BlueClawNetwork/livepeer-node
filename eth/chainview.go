@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/livepeer/node/eth/contracts"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -26,6 +28,9 @@ import (
 type ChainView struct {
 	chain           PaymentChain
 	maxAge          time.Duration
+	maxEntries      int
+	idleAfter       time.Duration
+	batchSize       int
 	now             func() time.Time
 	onBatchFallback func()
 	refreshing      sync.Mutex // Observations run one at a time.
@@ -38,10 +43,22 @@ type ChainView struct {
 	batchRetry time.Time // When to try batches again; zero while they are in use.
 }
 
+// Defaults bound what a flood of new addresses can cost: at most this many entries
+// are held, and at most this many reads of them run at once.
+const (
+	defaultViewEntries   = 1024
+	defaultViewIdleAfter = 10 * time.Minute
+	defaultViewBatchSize = 100
+	viewConcurrency      = 8
+)
+
 // ChainViewOptions configures a ChainView. Interval and MaxAge are required.
 type ChainViewOptions struct {
 	Interval, MaxAge time.Duration
 	Recipients       []ethcommon.Address // Observed from the first refresh.
+	MaxEntries       int                 // Tracked payers, and tracked recipients; defaults to 1024.
+	IdleAfter        time.Duration       // Stop reading an entry unused this long; defaults to 10 minutes.
+	BatchSize        int                 // Calls in one batch; defaults to 100.
 	Now              func() time.Time    // Defaults to time.Now.
 	OnBatchFallback  func()              // Called when reads run sequentially because batches are refused.
 }
@@ -70,9 +87,18 @@ func NewChainView(chain PaymentChain, options ChainViewOptions) (*ChainView, err
 	if chain.Contracts == nil || options.Interval <= 0 || options.MaxAge <= options.Interval {
 		return nil, errors.New("chain view requires contracts, a positive interval and a greater maximum age")
 	}
-	v := &ChainView{chain: chain, maxAge: options.MaxAge, now: options.Now, onBatchFallback: options.OnBatchFallback, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
+	v := &ChainView{chain: chain, maxAge: options.MaxAge, maxEntries: options.MaxEntries, idleAfter: options.IdleAfter, batchSize: options.BatchSize, now: options.Now, onBatchFallback: options.OnBatchFallback, payers: map[viewPayer]time.Time{}, recipients: map[ethcommon.Address]time.Time{}}
 	if v.now == nil {
 		v.now = time.Now
+	}
+	if v.maxEntries == 0 {
+		v.maxEntries = defaultViewEntries
+	}
+	if v.idleAfter == 0 {
+		v.idleAfter = defaultViewIdleAfter
+	}
+	if v.batchSize == 0 {
+		v.batchSize = defaultViewBatchSize
 	}
 	for _, recipient := range options.Recipients {
 		v.recipients[recipient] = v.now()
@@ -137,7 +163,9 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 		return false, errChainViewUnavailable
 	}
 	v.mu.Lock()
-	v.recipients[recipient] = v.now()
+	if evicted, ok := touchViewEntry(v.recipients, recipient, v.now(), v.maxEntries); ok && v.current != nil {
+		delete(v.current.active, evicted)
+	}
 	active, ok := obs.active[recipient]
 	v.mu.Unlock()
 	if ok {
@@ -153,7 +181,9 @@ func (v *ChainView) IsActiveAt(ctx context.Context, recipient ethcommon.Address,
 			return false, err
 		}
 		v.mu.Lock()
-		obs.active[recipient] = active
+		if _, tracked := v.recipients[recipient]; tracked {
+			obs.active[recipient] = active
+		}
 		v.mu.Unlock()
 		return active, nil
 	})
@@ -198,7 +228,9 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 	}
 	key := viewPayer{payer, recipient}
 	v.mu.Lock()
-	v.payers[key] = v.now()
+	if evicted, ok := touchViewEntry(v.payers, key, v.now(), v.maxEntries); ok && v.current != nil {
+		delete(v.current.funds, evicted)
+	}
 	info, ok := obs.funds[key]
 	v.mu.Unlock()
 	if ok {
@@ -215,7 +247,9 @@ func (v *ChainView) PayerFunds(ctx context.Context, payer, recipient ethcommon.A
 		}
 		info.Snapshot = obs.snapshot
 		v.mu.Lock()
-		obs.funds[key] = info
+		if _, tracked := v.payers[key]; tracked {
+			obs.funds[key] = info
+		}
 		v.mu.Unlock()
 		return info, nil
 	})
@@ -244,14 +278,8 @@ func (v *ChainView) Refresh(ctx context.Context) error {
 		v.batchRetry = time.Time{}
 	}
 	prior := v.current
-	payers := make([]viewPayer, 0, len(v.payers))
-	for key := range v.payers {
-		payers = append(payers, key)
-	}
-	recipients := make([]ethcommon.Address, 0, len(v.recipients))
-	for recipient := range v.recipients {
-		recipients = append(recipients, recipient)
-	}
+	cutoff := at.Add(-v.idleAfter)
+	payers, recipients := expireViewEntries(v.payers, cutoff), expireViewEntries(v.recipients, cutoff)
 	v.mu.Unlock()
 	obs, err := v.newRead(reference).observe(ctx, at, header.Hash.Hex(), block, prior, payers, recipients)
 	if err != nil {
@@ -290,6 +318,41 @@ func (v *ChainView) newRead(reference map[string]any) *viewRead {
 	return &viewRead{view: v, reference: reference, results: map[viewCallKey]*viewCall{}}
 }
 
+// touchViewEntry records a use, making room at the limit by evicting the entry
+// unused the longest. Scanning at the limit costs far less than the read it precedes.
+func touchViewEntry[K comparable](entries map[K]time.Time, key K, now time.Time, limit int) (evicted K, ok bool) {
+	if _, tracked := entries[key]; !tracked && len(entries) >= limit {
+		var oldest time.Time
+		for candidate, used := range entries {
+			if !ok || used.Before(oldest) {
+				evicted, oldest, ok = candidate, used, true
+			}
+		}
+		delete(entries, evicted)
+	}
+	entries[key] = now
+	return evicted, ok
+}
+
+func expireViewEntries[K comparable](entries map[K]time.Time, cutoff time.Time) []K {
+	keys := make([]K, 0, len(entries))
+	for key, used := range entries {
+		if used.Before(cutoff) {
+			delete(entries, key)
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// Tracked returns how many payers later observations will read.
+func (v *ChainView) Tracked() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.payers)
+}
+
 func (r *viewRead) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	key := viewCallKey{*msg.To, string(msg.Data)}
 	call, ok := r.results[key]
@@ -307,14 +370,29 @@ func (r *viewRead) CodeAt(context.Context, ethcommon.Address, *big.Int) ([]byte,
 	return nil, nil
 }
 
-// fetch reads the queued calls. A refused batch falls back to sequential reads,
-// still pinned to this read's block.
+// fetch reads the queued calls in bounded batches. A refused batch falls back to
+// sequential reads, still pinned to this read's block.
 func (r *viewRead) fetch(ctx context.Context) {
 	keys := r.pending
 	r.pending = nil
 	if r.view.batching() {
-		keys = r.fetchBatch(ctx, keys)
-		if len(keys) == 0 {
+		var (
+			mu      sync.Mutex
+			refused []viewCallKey
+			batches errgroup.Group
+		)
+		batches.SetLimit(viewConcurrency)
+		for chunk := range slices.Chunk(keys, r.view.batchSize) {
+			batches.Go(func() error {
+				unanswered := r.fetchBatch(ctx, chunk)
+				mu.Lock()
+				defer mu.Unlock()
+				refused = append(refused, unanswered...)
+				return nil
+			})
+		}
+		_ = batches.Wait()
+		if keys = refused; len(keys) == 0 {
 			return
 		}
 		// A batch fails the same way during an outage or a reorg. Only a call that
@@ -330,9 +408,15 @@ func (r *viewRead) fetch(ctx context.Context) {
 		keys = keys[1:]
 	}
 	r.view.notifyFallback()
+	var calls errgroup.Group
+	calls.SetLimit(viewConcurrency)
 	for _, key := range keys {
-		r.fetchOne(ctx, key)
+		calls.Go(func() error {
+			r.fetchOne(ctx, key)
+			return nil
+		})
 	}
+	_ = calls.Wait()
 }
 
 // fetchBatch reads keys in one batch and returns those it got no answer for: all

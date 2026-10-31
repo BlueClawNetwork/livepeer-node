@@ -473,3 +473,76 @@ func TestChainViewTriesBatchesAgainLater(t *testing.T) {
 	require.Equal(t, 1, stats.Batches)
 	require.Equal(t, 2, stats.RoundTrips)
 }
+
+func TestChainViewBoundsItsPayerSet(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, clock := newTestView(t, rpc, func(options *ChainViewOptions) { options.MaxEntries = 4 })
+	require.NoError(t, view.Refresh(t.Context()))
+	address := func(i int) ethcommon.Address { return ethcommon.BigToAddress(big.NewInt(int64(0x5000 + i))) }
+	read := func(payer ethcommon.Address) {
+		t.Helper()
+		_, err := view.PayerFunds(t.Context(), payer, viewRecipientAddress)
+		require.NoError(t, err)
+	}
+	read(viewPayerAddress)
+	for i := range 100 {
+		clock.Advance(time.Millisecond)
+		read(viewPayerAddress) // Recently used, so it survives the flood.
+		clock.Advance(time.Millisecond)
+		read(address(i))
+	}
+	require.LessOrEqual(t, view.Tracked(), 4, "a flood of new addresses cannot grow memory")
+	require.NoError(t, view.Refresh(t.Context()))
+	rpc.Reset()
+	read(viewPayerAddress)
+	require.Zero(t, rpc.Stats().RoundTrips, "the payer in use kept its place")
+	read(address(0))
+	require.Equal(t, 1, rpc.Stats().RoundTrips, "an evicted payer reads again")
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.Equal(t, 8, rpc.Stats().Calls["TicketBroker.getSenderInfo"]+rpc.Stats().Calls["TicketBroker.claimableReserve"], "the refresh reads only the bounded set")
+}
+
+func TestChainViewEvictsIdleEntries(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, clock := newTestView(t, rpc, func(options *ChainViewOptions) { options.IdleAfter, options.MaxAge = time.Minute, time.Hour })
+	require.NoError(t, view.Refresh(t.Context()))
+	idle, used := ethcommon.HexToAddress("0x2001"), ethcommon.HexToAddress("0x2002")
+	for _, payer := range []ethcommon.Address{idle, used} {
+		_, err := view.PayerFunds(t.Context(), payer, viewRecipientAddress)
+		require.NoError(t, err)
+	}
+	clock.Advance(31 * time.Second)
+	_, err := view.PayerFunds(t.Context(), used, viewRecipientAddress)
+	require.NoError(t, err)
+	clock.Advance(30 * time.Second)
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	require.Equal(t, 1, rpc.Stats().Calls["TicketBroker.getSenderInfo"], "only the payer used within the idle period is read")
+	require.Equal(t, 1, view.Tracked())
+}
+
+func TestChainViewSplitsLargeObservations(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc, func(options *ChainViewOptions) { options.BatchSize = 10 })
+	require.NoError(t, view.Refresh(t.Context()))
+	for i := range 20 {
+		_, err := view.PayerFunds(t.Context(), ethcommon.BigToAddress(big.NewInt(int64(0x5000+i))), viewRecipientAddress)
+		require.NoError(t, err)
+	}
+	rpc.Reset()
+	require.NoError(t, view.Refresh(t.Context()))
+	stats := rpc.Stats()
+	require.Greater(t, stats.Batches, 4, "20 payers of two calls each exceed four batches of ten")
+	for _, size := range stats.BatchSizes {
+		require.LessOrEqual(t, size, 10)
+	}
+	require.Equal(t, 20, stats.Calls["TicketBroker.getSenderInfo"])
+	require.Zero(t, stats.Unpinned)
+	rpc.Reset()
+	for i := range 20 {
+		_, err := view.PayerFunds(t.Context(), ethcommon.BigToAddress(big.NewInt(int64(0x5000+i))), viewRecipientAddress)
+		require.NoError(t, err)
+	}
+	require.Zero(t, rpc.Stats().RoundTrips, "every chunk's results reached the observation")
+}
