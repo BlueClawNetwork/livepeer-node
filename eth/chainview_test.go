@@ -546,3 +546,28 @@ func TestChainViewSplitsLargeObservations(t *testing.T) {
 	}
 	require.Zero(t, rpc.Stats().RoundTrips, "every chunk's results reached the observation")
 }
+
+// A load balancer can send one request to a backend behind the others. Funds that
+// dropped must not reappear because the next observation landed there.
+func TestChainViewDoesNotMoveBackwards(t *testing.T) {
+	rpc := fundedViewChain(t)
+	view, _ := newTestView(t, rpc)
+	lagging := rpc.Head()
+	rpc.Mine(func(state *test.ChainState) {
+		state.L1Block = 1001
+		state.SetSender(viewPayerAddress, test.ChainSender{Deposit: big.NewInt(1), Reserve: big.NewInt(1), WithdrawRound: new(big.Int)})
+	})
+	require.NoError(t, view.Refresh(t.Context()))
+	funds, err := view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(1), funds.Deposit)
+	head := rpc.Head()
+	rpc.Rewind(lagging)
+	require.Error(t, view.Refresh(t.Context()))
+	funds, err = view.PayerFunds(t.Context(), viewPayerAddress, viewRecipientAddress)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(1), funds.Deposit)
+	require.Equal(t, big.NewInt(1001), funds.Snapshot.Block)
+	rpc.Rewind(head)
+	require.NoError(t, view.Refresh(t.Context()))
+}

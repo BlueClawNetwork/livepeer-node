@@ -74,6 +74,7 @@ type viewContracts struct{ rounds, bonding, broker ethcommon.Address }
 // only when pinned to that same block, so an observation never mixes blocks.
 type chainObservation struct {
 	at        time.Time // Taken before the block read, so age is never understated.
+	number    *big.Int  // Chain height, which unlike the L1 clock moves every block.
 	block     string
 	reference map[string]any
 	contracts viewContracts
@@ -281,10 +282,16 @@ func (v *ChainView) Refresh(ctx context.Context) error {
 	cutoff := at.Add(-v.idleAfter)
 	payers, recipients := expireViewEntries(v.payers, cutoff), expireViewEntries(v.recipients, cutoff)
 	v.mu.Unlock()
-	obs, err := v.newRead(reference).observe(ctx, at, header.Hash.Hex(), block, prior, payers, recipients)
+	// Keep reads monotonic behind a load balancer. The last observation ages out if
+	// the RPC stays behind it, and a reorg to a shorter chain catches up in blocks.
+	if prior != nil && (*big.Int)(header.Number).Cmp(prior.number) < 0 {
+		return errors.New("chain head moved behind the last observation")
+	}
+	obs, err := v.newRead(reference).observe(ctx, at, block, prior, payers, recipients)
 	if err != nil {
 		return err
 	}
+	obs.number, obs.block = (*big.Int)(header.Number), header.Hash.Hex()
 	v.mu.Lock()
 	v.current = obs
 	v.mu.Unlock()
@@ -557,7 +564,7 @@ const maxViewBatches = 3
 // observation fits one batch after the block read. Only results under the addresses
 // and round this block confirms are used; a wrong assumption costs a follow-up batch
 // pinned to the same block.
-func (r *viewRead) observe(ctx context.Context, at time.Time, hash string, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, error) {
+func (r *viewRead) observe(ctx context.Context, at time.Time, block *big.Int, prior *chainObservation, payers []viewPayer, recipients []ethcommon.Address) (*chainObservation, error) {
 	if prior != nil {
 		r.dependents(ctx, prior.contracts, prior.snapshot.Round, payers, recipients)
 	}
@@ -577,7 +584,7 @@ func (r *viewRead) observe(ctx context.Context, at time.Time, hash string, block
 		if err != nil {
 			return nil, err
 		}
-		obs := &chainObservation{at: at, block: hash, reference: r.reference, contracts: known, funds: deps.funds, active: deps.active}
+		obs := &chainObservation{at: at, reference: r.reference, contracts: known, funds: deps.funds, active: deps.active}
 		obs.snapshot = ChainSnapshot{Block: block, Round: deps.round, RoundHash: deps.hash, blockReference: r.reference, observation: obs}
 		for key, info := range obs.funds {
 			info.Snapshot = obs.snapshot
