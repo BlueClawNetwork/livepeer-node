@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -63,6 +64,9 @@ type Params struct {
 	OrchestratorWebhookHeaders         Headers       `name:"orchestrator-webhook-headers" optional:"true" secret:"true"`
 	OrchestratorWebhookHeadersFile     string        `basepath:"source" name:"orchestrator-webhook-headers-file" secretfor:"OrchestratorWebhookHeaders"`
 	OrchestratorWebhookRefreshInterval time.Duration `name:"orchestrator-webhook-refresh-interval" default:"5m" descr:"Orchestrator webhook refresh interval; must be positive when enabled"`
+
+	ChainRefreshInterval time.Duration `default:"5s" descr:"Chain view refresh interval for payments; 0 reads the chain on every request"`
+	ChainMaxAge          time.Duration `default:"30s" descr:"Refuse payments when the chain view is older than this; must exceed chain-refresh-interval"`
 }
 
 func (p Params) payerPolicy() (pm.PayerPolicy, error) {
@@ -88,6 +92,12 @@ func (p Params) discoveryURLs() []*url.URL {
 func (p Params) Validate() error {
 	if err := validateDiscoveryPolling(p.DiscoveryRefreshInterval, p.DiscoveryMaxFailedRefreshes); err != nil {
 		return err
+	}
+	if p.ChainRefreshInterval > 0 && p.ChainMaxAge > eth.MaxChainViewAge {
+		return fmt.Errorf("--chain-max-age must be at most %s, far below the life of ticket parameters", eth.MaxChainViewAge)
+	}
+	if p.ChainRefreshInterval < 0 || (p.ChainRefreshInterval > 0 && p.ChainMaxAge <= p.ChainRefreshInterval) {
+		return errors.New("--chain-refresh-interval must be nonnegative and --chain-max-age must be greater than it; an interval of 0 reads the chain directly")
 	}
 	if p.Network != "" && p.ChainID == nil {
 		return errors.New("--network (or LIVEPEER_SIGNER_NETWORK) requires an explicit --chain-id and --controller-address for custom networks")
@@ -172,6 +182,7 @@ func serve(parent context.Context, p Params) error {
 	}
 	defer rpc.Close()
 	rpc.SetObserver(service.metrics.RPC)
+	rpc.SetCallObserver(service.metrics.RPCCall)
 	var chainID *big.Int
 	if p.ChainID != nil {
 		chainID = new(big.Int).SetUint64(*p.ChainID)
@@ -183,7 +194,17 @@ func serve(parent context.Context, p Params) error {
 	if err != nil {
 		return fmt.Errorf("initialize signer contract bindings: %w", err)
 	}
+	var chainView *eth.ChainView
 	service.SetPaymentChain(pm.EthereumChain{Client: eth.PaymentChain{Contracts: contracts}})
+	if p.ChainRefreshInterval > 0 {
+		chainView, err = eth.NewChainView(eth.PaymentChain{Contracts: contracts}, eth.ChainViewOptions{Interval: p.ChainRefreshInterval, MaxAge: p.ChainMaxAge,
+			OnRefresh: service.metrics.ChainViewRefreshHook(slog.With("component", "signer")), OnBatchFallback: service.metrics.ChainViewBatchFallback})
+		if err != nil {
+			return fmt.Errorf("initialize chain view (check --chain-refresh-interval and --chain-max-age): %w", err)
+		}
+		service.metrics.ChainView(chainView.Age, chainView.Tracked)
+		service.SetPaymentChain(chainView)
+	}
 	policy, _ := newPricePolicy(p.MaxHourlyPrice, p.MaxFixedPrice)
 	policy.metrics = service.metrics
 	if p.WeiPerUSD == nil {
@@ -258,6 +279,9 @@ func serve(parent context.Context, p Params) error {
 	defer publisherStop()
 	if producer != nil {
 		workers.Go(func() { producer.run(publisherCtx) })
+	}
+	if chainView != nil {
+		workers.Go(func() { chainView.Run(ctx) })
 	}
 	workers.Go(func() { service.RunOrchestratorWebhook(ctx) })
 	workers.Go(func() { service.RunDiscovery(ctx) })

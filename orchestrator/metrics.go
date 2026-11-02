@@ -125,9 +125,16 @@ type paidReadiness struct {
 	chain, active, storage bool
 	snapshot               eth.ChainSnapshot
 	interval               time.Duration
+	view                   pm.PaymentChain // Set when payments read through a chain view.
 }
 
 func (p *paidReadiness) ready(registry *Registry) bool {
+	// A view refuses as soon as it passes its maximum age, between checks too.
+	if p.view != nil {
+		if _, err := p.view.Snapshot(context.Background()); err != nil {
+			return false
+		}
+	}
 	p.mu.Lock()
 	limit := max(time.Minute, 3*p.interval)
 	ok := p.chain && p.active && p.storage && !p.completed.IsZero() && time.Since(p.completed) <= limit && !p.workerCompleted.IsZero() && time.Since(p.workerCompleted) <= limit
@@ -139,10 +146,14 @@ func (p *paidReadiness) ready(registry *Registry) bool {
 }
 
 func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, engine *PaymentEngine, metrics *observability.Metrics, logger *slog.Logger) {
-	snapshot, chainErr := chain.Snapshot(ctx)
+	reads := p.view
+	if reads == nil {
+		reads = pm.EthereumChain{Client: chain}
+	}
+	snapshot, chainErr := reads.Snapshot(ctx)
 	active := false
 	if chainErr == nil {
-		active, chainErr = chain.IsActiveAt(ctx, engine.recipient, snapshot)
+		active, chainErr = reads.IsActiveAt(ctx, engine.recipient, snapshot)
 	}
 	dbCtx, cancel := context.WithTimeout(ctx, time.Second)
 	storageErr := store.checkStorage(dbCtx)
@@ -163,7 +174,7 @@ func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.
 		if snapshot.Round != nil {
 			metrics.Gauge("chain_snapshot_round", nil).Set(float64(snapshot.Round.Int64()))
 		}
-		metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(time.Now().Unix()))
+		metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(snapshot.ObservedAt().Unix()))
 	}
 	if balance, err := chain.Contracts.RPC.BalanceAt(ctx, p.account, nil); err == nil {
 		metrics.Gauge("redeemer_gas_balance_eth", nil).Set(observability.ETH(new(big.Rat).SetInt(balance)))
@@ -244,6 +255,11 @@ func (e *PaymentEngine) paymentLabels(runner, manifest string) observability.Lab
 		return nil
 	}
 	return e.identity(runner, manifest).Labels()
+}
+
+// observeDuration is deferred with its arguments taken at the start of an operation.
+func (e *PaymentEngine) observeDuration(operation string, start time.Time, labels observability.Labels) {
+	e.metrics.Observe("payment_operation_duration_seconds", time.Since(start).Seconds(), labels.With("operation", operation))
 }
 
 func (e *PaymentEngine) recordPayment(operation string, err error, labels observability.Labels) {

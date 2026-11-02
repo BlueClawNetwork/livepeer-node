@@ -76,6 +76,7 @@ type Challenge struct {
 // parameters are authenticated by the recipient HMAC.
 func (e *PaymentEngine) MakeChallenge(ctx context.Context, runner, manifest string, payer ethcommon.Address, price int64, unit, service string) (challenge Challenge, result error) {
 	labels := e.paymentLabels(runner, manifest)
+	defer e.observeDuration("challenge", time.Now(), labels)
 	defer func() { e.recordPayment("challenge", result, labels) }()
 	return e.makeChallenge(ctx, runner, manifest, payer, price, unit, service)
 }
@@ -151,6 +152,7 @@ func (e *PaymentEngine) ChallengeForManifest(runner, manifest, service string) (
 
 func (e *PaymentEngine) RefreshChallenge(ctx context.Context, manifest string, payer ethcommon.Address, service string) (challenge Challenge, result error) {
 	labels := e.paymentLabels("", manifest)
+	defer e.observeDuration("refresh", time.Now(), labels)
 	defer func() { e.recordPayment("refresh", result, labels) }()
 	e.mu.Lock()
 	current := e.sessions[manifest]
@@ -207,6 +209,7 @@ func decodeHeaders(paymentHeader, segmentHeader string) (wire.Payment, wire.SegD
 
 func (e *PaymentEngine) Receive(ctx context.Context, runner, manifest, paymentHeader, segmentHeader string) (payerResult ethcommon.Address, credit *big.Rat, result error) {
 	labels := e.paymentLabels(runner, manifest)
+	defer e.observeDuration("receive", time.Now(), labels)
 	defer func() { e.recordPayment("receive", result, labels) }()
 	payment, segment, err := decodeHeaders(paymentHeader, segmentHeader)
 	if err != nil {

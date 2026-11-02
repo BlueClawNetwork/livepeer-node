@@ -42,6 +42,8 @@ Flags:
       --health-grants strings              Private static runner health IP[:port] or CIDR grants (env: LIVEPEER_ORCHESTRATOR_HEALTH_GRANTS)
       --heartbeat-interval duration        Runner heartbeat interval (env: LIVEPEER_ORCHESTRATOR_HEARTBEAT_INTERVAL) (default 5s)
       --heartbeat-ttl duration             Runner heartbeat expiry (env: LIVEPEER_ORCHESTRATOR_HEARTBEAT_TTL) (default 30s)
+      --chain-refresh-interval duration    Chain view refresh interval for paid requests; 0 reads the chain on every request (env: LIVEPEER_ORCHESTRATOR_CHAIN_REFRESH_INTERVAL) (default 5s)
+      --chain-max-age duration             Refuse paid requests when the chain view is older than this; must exceed chain-refresh-interval (env: LIVEPEER_ORCHESTRATOR_CHAIN_MAX_AGE) (default 30s)
       --print-config                       Print audited redacted TOML configuration
   -h, --help                               help for livepeer-orchestrator
   -v, --version                            version for livepeer-orchestrator

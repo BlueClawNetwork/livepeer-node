@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math/big"
-	"time"
 
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/pm"
@@ -56,7 +55,7 @@ func (s *Service) signMessage(kind string, data []byte) ([]byte, error) {
 
 func (s *Service) observeFunds(funds pm.PayerFunds, total bool) {
 	if funds.Snapshot.Block != nil && funds.Snapshot.Round != nil {
-		s.metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(time.Now().Unix()))
+		s.metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(funds.Snapshot.ObservedAt().Unix()))
 	}
 	if funds.Snapshot.Block != nil {
 		s.metrics.Gauge("chain_snapshot_block", nil).Set(float64(funds.Snapshot.Block.Int64()))

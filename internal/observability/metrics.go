@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -209,6 +210,47 @@ func (m *Metrics) RPC(method string, elapsed time.Duration, err error) {
 	labels := Labels{"method": method}
 	m.Add("rpc_requests_total", 1, labels.With("outcome", ErrorKind(err)))
 	m.Observe("rpc_request_duration_seconds", elapsed.Seconds(), labels)
+}
+
+// RPCCall counts one eth_call, including each call inside a batch. RPC counts HTTP
+// requests, so a batch is one request and many calls.
+func (m *Metrics) RPCCall(contract, function string) {
+	m.Add("rpc_contract_calls_total", 1, Labels{"contract": contract, "function": function})
+}
+
+// ChainViewRefresh records one chain view observation.
+func (m *Metrics) ChainViewRefresh(outcome string, elapsed time.Duration) {
+	m.Add("chain_view_refreshes_total", 1, Labels{"outcome": outcome})
+	m.Observe("chain_view_refresh_duration_seconds", elapsed.Seconds(), nil)
+}
+
+// ChainViewRefreshHook records each observation and logs a change between working
+// and failing, without repeating a failure at every interval. Refreshes run serially.
+func (m *Metrics) ChainViewRefreshHook(logger *slog.Logger) func(string, time.Duration, error) {
+	failing := false
+	return func(outcome string, elapsed time.Duration, err error) {
+		m.ChainViewRefresh(outcome, elapsed)
+		if failing != (err != nil) {
+			failing = err != nil
+			logger.Info("chain view state changed", "event", "chain_view", "operation", "refresh", "outcome", outcome, "error_kind", ErrorKind(err))
+		}
+	}
+}
+
+// ChainViewBatchFallback counts reads run sequentially because batches are refused.
+func (m *Metrics) ChainViewBatchFallback() {
+	m.Add("chain_view_batch_fallbacks_total", 1, nil)
+}
+
+// ChainView reports a chain view's state at scrape time, from memory. Age is absent
+// until the first observation, since nothing has been observed to have an age.
+func (m *Metrics) ChainView(age func() (time.Duration, bool), tracked func() int) {
+	m.Snapshot(func(emit Emit) {
+		if elapsed, ok := age(); ok {
+			emit("chain_view_age_seconds", elapsed.Seconds(), nil)
+		}
+		emit("chain_view_tracked_payers", float64(tracked()), nil)
+	})
 }
 
 func (m *Metrics) Discovery(source int, elapsed time.Duration, err error) {

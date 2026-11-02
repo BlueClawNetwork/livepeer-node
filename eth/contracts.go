@@ -45,6 +45,9 @@ var bindingMetadata = map[string]*bind.MetaData{
 	"priceFeed":       chainlink.AggregatorV3InterfaceMetaData,
 }
 
+// controllerNames maps binding names to their Controller registry names.
+var controllerNames = map[string]string{"bondingManager": "BondingManager", "ticketBroker": "TicketBroker", "roundsManager": "RoundsManager", "serviceRegistry": "ServiceRegistry", "livepeerToken": "LivepeerToken", "minter": "Minter", "governor": "LivepeerGovernor"}
+
 func OpenContracts(rpc *RPC, controller string) (*Contracts, error) {
 	if !ValidAddress(controller) {
 		return nil, errors.New("controller-address must be a 20-byte Ethereum address")
@@ -69,17 +72,21 @@ func (c *Contracts) Resolve(ctx context.Context, name string) (ethcommon.Address
 }
 
 func (c *Contracts) ResolveAt(ctx context.Context, block any, name string) (ethcommon.Address, error) {
+	return c.resolveWith(ctx, c.callerAt(block), name)
+}
+
+func (c *Contracts) resolveWith(ctx context.Context, caller bind.ContractCaller, name string) (ethcommon.Address, error) {
 	if _, ok := c.abis[name]; !ok {
 		return ethcommon.Address{}, errors.New("unsupported contract")
 	}
 	if name == "controller" {
 		return c.Controller, nil
 	}
-	contractName := map[string]string{"bondingManager": "BondingManager", "ticketBroker": "TicketBroker", "roundsManager": "RoundsManager", "serviceRegistry": "ServiceRegistry", "livepeerToken": "LivepeerToken", "minter": "Minter", "governor": "LivepeerGovernor"}[name]
+	contractName := controllerNames[name]
 	if contractName == "" {
 		return ethcommon.Address{}, errors.New("contract requires an explicit address")
 	}
-	controller, err := contracts.NewControllerCaller(c.Controller, c.callerAt(block))
+	controller, err := contracts.NewControllerCaller(c.Controller, caller)
 	if err != nil {
 		return ethcommon.Address{}, err
 	}

@@ -133,6 +133,37 @@ permissions, and prints its address (`--output json` for scripts).
 `--keystore-file` selects a new path in an existing parent directory; existing
 files are never overwritten. No account address is required.
 
+## Chain reads for payments
+
+Paid orchestrators and signers read chain state from an in-memory view, so RPC
+load follows a timer rather than request volume. One loop per process reads the
+latest block, then contract addresses, round, recipient status, and the funds of
+payers in use, with every call pinned to that block. Redemption, receipts,
+finality, and nonces always read the chain directly.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `ChainRefreshInterval` / `--chain-refresh-interval` | `5s` | Time between refreshes. `0` disables the view; every request then reads the chain. |
+| `ChainMaxAge` / `--chain-max-age` | `30s` | Refuse payments when the view is older than this. It must exceed the interval, and be at most `2m`. |
+
+Past the maximum age, or before the first refresh, payments fail as they do when
+a chain read fails and readiness fails with them. A failed refresh keeps the last
+good view only until then.
+
+Requests may therefore act on chain state as old as the interval, or the maximum
+age while refreshes are failing, so a payer's new deposit can take a refresh to
+appear. Ticket parameters last 40 L1 blocks, about eight minutes, so `ChainMaxAge`
+is capped far below that. A signer asks for fresh parameters earlier by the L1
+blocks its view can be behind, about one for every 12 seconds of `ChainMaxAge`, so
+it doesn't sign parameters the orchestrator has already seen expire. Lowering either setting raises idle RPC use: each
+refresh is two round trips of about seven calls, plus two per payer in use.
+
+A payer's first request reads its funds inline at the view's block, sharing the
+read with concurrent requests. At most 1,024 payers are kept, evicting the least
+recently used, and payers idle for ten minutes stop being read. If the RPC refuses
+JSON-RPC batches, reads run sequentially and
+`livepeer_chain_view_batch_fallbacks_total` counts them.
+
 ## Local storage and probes
 
 Missing storage directories are created with `0700` permissions; existing

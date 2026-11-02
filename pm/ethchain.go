@@ -44,3 +44,4 @@ func (c EthereumChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addre
 }
 
 var _ PaymentChain = EthereumChain{}
+var _ PaymentChain = (*eth.ChainView)(nil)

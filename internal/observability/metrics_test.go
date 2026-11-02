@@ -1,13 +1,17 @@
 package observability_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/internal/test"
@@ -158,4 +162,34 @@ func TestUnknownInputsDoNotCreateSeries(t *testing.T) {
 	require.EqualValues(t, 50, test.MetricSum(t, m.Registry, "http_requests_total", map[string]string{"operation": "unknown", "method": "other"}))
 	other := observability.New("test")
 	require.Zero(t, test.MetricSum(t, other.Registry, "http_requests_total", nil), "registries must be isolated")
+}
+
+func TestChainViewMetricsAndStateChanges(t *testing.T) {
+	m := observability.New("test")
+	observed := false
+	m.ChainView(func() (time.Duration, bool) { return 3 * time.Second, observed }, func() int { return 7 })
+	require.Empty(t, test.MetricSamples(t, m.Registry, "chain_view_age_seconds", nil), "no observation has no age")
+	require.EqualValues(t, 7, test.MetricSum(t, m.Registry, "chain_view_tracked_payers", nil))
+	observed = true
+	require.EqualValues(t, 3, test.MetricSum(t, m.Registry, "chain_view_age_seconds", nil))
+
+	var logs bytes.Buffer
+	refresh := m.ChainViewRefreshHook(slog.New(slog.NewJSONHandler(&logs, nil)))
+	refresh("success", time.Millisecond, nil)
+	require.Empty(t, logs.String(), "a working view is not news")
+	failure := errors.New("https://user:private-rpc-detail@rpc.example failed")
+	refresh("error", time.Millisecond, failure)
+	refresh("error", time.Millisecond, failure)
+	require.Equal(t, 1, strings.Count(logs.String(), "chain view"), "an unchanged failure does not repeat")
+	require.NotContains(t, logs.String(), "private-rpc-detail")
+	refresh("partial", time.Millisecond, nil)
+	require.Equal(t, 2, strings.Count(logs.String(), "chain view"), "recovery is logged")
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_refreshes_total", map[string]string{"outcome": "success"}))
+	require.EqualValues(t, 2, test.MetricSum(t, m.Registry, "chain_view_refreshes_total", map[string]string{"outcome": "error"}))
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_refreshes_total", map[string]string{"outcome": "partial"}))
+	require.EqualValues(t, 4, test.MetricSum(t, m.Registry, "chain_view_refresh_duration_seconds", nil))
+	m.ChainViewBatchFallback()
+	m.RPCCall("ticketBroker", "getSenderInfo")
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_batch_fallbacks_total", nil))
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_contract_calls_total", map[string]string{"contract": "ticketBroker", "function": "getSenderInfo"}))
 }

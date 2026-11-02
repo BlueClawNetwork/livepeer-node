@@ -36,6 +36,10 @@ RPCURLFile = "/run/secrets/livepeer-signer-rpc-url"
 # Controller = "0xD8E8328501E9645d16Cf49539efC04f734606ee4"
 # ETHUSDFeed = "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"
 # WeiPerUSD = "500000000000000" # Fixed conversion overrides oracle, for testing.
+# Payments read chain state from memory, refreshed on this timer, and are refused
+# when it is older than ChainMaxAge. An interval of 0 reads the chain on every request.
+# ChainRefreshInterval = "5s"
+# ChainMaxAge = "30s"
 
 # USD is implicit. Live quotes are compared with MaxHourlyPrice / 3600.
 MaxHourlyPrice = "36"

@@ -58,13 +58,22 @@ type Service struct {
 	discoveryInterval time.Duration
 	orchWebhook       *orchestratorWebhook
 	paymentChain      pm.PayerChain
+	expiryMargin      int64 // L1 blocks the payment chain's clock can be behind.
 	payerPolicy       pm.PayerPolicy
 	pricePolicy       *pricePolicy
 	events            signedTicketSink
 	slots             chan struct{}
 }
 
-func (s *Service) SetPaymentChain(chain pm.PayerChain) { s.paymentChain = chain }
+// SetPaymentChain sets where funds and the L1 clock come from. A chain view's clock
+// can be behind the orchestrator's, so the signer then asks for fresh parameters that
+// much earlier, instead of signing ones the orchestrator has seen expire.
+func (s *Service) SetPaymentChain(chain pm.PayerChain) {
+	s.paymentChain, s.expiryMargin = chain, 0
+	if view, ok := chain.(interface{ MaxL1BlocksBehind() int64 }); ok {
+		s.expiryMargin = view.MaxL1BlocksBehind()
+	}
+}
 
 func (s *Service) SetPayerPolicy(policy pm.PayerPolicy) error {
 	if err := policy.Validate(); err != nil {
@@ -344,7 +353,7 @@ func checkMaxPrice(req paymentRequest, price wire.PriceInfo) error {
 }
 
 func (s *Service) generate(w http.ResponseWriter, r *http.Request) {
-	paymentType, outcome := "unknown", "rejected"
+	paymentType, outcome, start := "unknown", "rejected", time.Now()
 	defer func() {
 		if outcome != "success" && errors.Is(r.Context().Err(), context.Canceled) {
 			outcome = "client_cancelled"
@@ -352,6 +361,7 @@ func (s *Service) generate(w http.ResponseWriter, r *http.Request) {
 			outcome = "error"
 		}
 		s.metrics.Add("signer_payments_total", 1, observability.Labels{"type": paymentType, "outcome": outcome})
+		s.metrics.Observe("signer_payment_duration_seconds", time.Since(start).Seconds(), observability.Labels{"type": paymentType})
 	}()
 	// MaxBytesReader needs net/http's original writer to close oversized requests.
 	body, err := io.ReadAll(http.MaxBytesReader(httpsnoop.Unwrap(w), r.Body, 1<<20))

@@ -271,6 +271,19 @@ func TestRecipientBatchReplayAndExpiry(t *testing.T) {
 	require.EqualValues(t, 3, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "receive", "outcome": "success"}))
 }
 
+func TestPaymentStepDurations(t *testing.T) {
+	e, _, key, _ := newRecipientTestEngine(t)
+	e.metrics = observability.New("orchestrator")
+	info := issueRecipientParams(t, e, key)
+	require.NoError(t, receiveRecipientPayment(t, e, key, info, 1))
+	require.ErrorIs(t, receiveRecipientPayment(t, e, key, info, 1), ErrInvalidPayment)
+	_, err := e.RefreshChallenge(t.Context(), "session", crypto.PubkeyToAddress(key.PublicKey), "https://orch.example")
+	require.NoError(t, err)
+	for operation, count := range map[string]int{"challenge": 1, "receive": 2, "refresh": 1} {
+		require.EqualValues(t, count, test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": operation}), operation)
+	}
+}
+
 func TestRecipientRestartRotatesSecretsAndPreservesWinningTickets(t *testing.T) {
 	e, chain, key, path := newRecipientTestEngine(t)
 	info := issueRecipientParams(t, e, key)
